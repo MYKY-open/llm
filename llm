@@ -1303,6 +1303,8 @@ run_mykyagent_standalone() {
     if [ ! -x "$MYKYAGENT_DIR/bin/mykyagent" ] || (! command -v pi &> /dev/null && [ ! -x "$PI_DIR/node_modules/.bin/pi" ]); then
         echo "MykyAgent or Pi runner is not ready locally."
         install_mykyagent || return 1
+    elif [ -d "$MYKYAGENT_DIR/.git" ]; then
+        (cd "$MYKYAGENT_DIR" && git pull --rebase --autostash -q 2>/dev/null || true)
     fi
 
     local remote_host="$1"
