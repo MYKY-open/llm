@@ -1319,6 +1319,7 @@ run_mykyagent_standalone() {
     fi
 
     export MYKYAGENT_BASE_URL="$base_url"
+    export MYKYAGENT_API_KEY="$API_KEY"
     export MODELS_FILE="$HOME/.pi/agent/models.json"
     if [ -n "$selected_alias" ]; then
         export SELECTED_ALIAS="$selected_alias"
