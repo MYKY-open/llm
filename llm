@@ -7,6 +7,7 @@ SCRIPT_PATH="$(readlink -f "$BASH_SOURCE")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
 # Main installation directory
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 BASE_DIR="${MYKYSW_DIR:-$HOME/mykysw}"
 
 # Lists / Config Directory
@@ -1277,6 +1278,17 @@ install_mykyagent() {
         echo "Error: node is not installed. Please install Node.js (v18+) first."
         return 1
     fi
+
+    if ! command -v uv &> /dev/null; then
+        echo -e "\033[33m[Warning] 'uv' is not installed. Web search/fetch tools and GGUF Auto-NGL require uv.\033[0m"
+        echo "          Install via: curl -LsSf https://astral.sh/uv/install.sh | sh"
+    fi
+
+    if ! command -v pi &> /dev/null && [ ! -x "$PI_DIR/node_modules/.bin/pi" ]; then
+        echo "Pi coding agent is required by MykyAgent. Installing Pi locally..."
+        install_pi || return 1
+    fi
+
     mkdir -p "$(dirname "$MYKYAGENT_DIR")"
     if [ -d "$MYKYAGENT_DIR/.git" ]; then
         (cd "$MYKYAGENT_DIR" && git pull --rebase --autostash)
@@ -1288,8 +1300,8 @@ install_mykyagent() {
 }
 
 run_mykyagent_standalone() {
-    if [ ! -x "$MYKYAGENT_DIR/bin/mykyagent" ]; then
-        echo "MykyAgent is not installed locally."
+    if [ ! -x "$MYKYAGENT_DIR/bin/mykyagent" ] || (! command -v pi &> /dev/null && [ ! -x "$PI_DIR/node_modules/.bin/pi" ]); then
+        echo "MykyAgent or Pi runner is not ready locally."
         install_mykyagent || return 1
     fi
 
@@ -1616,6 +1628,9 @@ run_model() {
             echo "[Auto-NGL] Fast-loaded layer sizes from cache!"
             IFS='|' read -r layers avg_block_mb non_block_mb <<< "$cache_hit"
         else
+            if ! command -v uv &>/dev/null; then
+                echo "[Auto-NGL] Notice: 'uv' is not installed; cannot probe GGUF architecture automatically."
+            fi
             local gguf_out
             gguf_out=$(uv run -q --with gguf python -c "
 import gguf, re
