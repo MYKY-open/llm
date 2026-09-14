@@ -78,7 +78,7 @@ else
     S_TOP_P="1.0"
     S_TOP_K="0"
     S_MIN_P="0.05"
-    S_XTC_PROB="0.2"
+    S_XTC_PROB="0.0"
     S_XTC_THRESH="0.1"
     S_TFS="1.0"
     S_TYPICAL="1.0"
@@ -121,7 +121,7 @@ S_DRAFT_MODEL="$S_DRAFT_MODEL"
 EOF
 fi
 
-: "${S_XTC_PROB:=0.2}"
+: "${S_XTC_PROB:=0.0}"
 : "${S_XTC_THRESH:=0.1}"
 
 if [ "$S_MIROSTAT" != "0" ]; then
@@ -571,8 +571,8 @@ configure_settings() {
         printf "%-3s %-25s %-22s %b%s%b\n" "17)" "Context Size (0=auto)" "[$S_CTX_SIZE]" "$w_desc" "- Maximum number of tokens the model can remember" "$w_res"
         printf "%-3s %-25s %-22s %b%s%b\n" "18)" "Draft Model Path" "[$S_DRAFT_MODEL]" "$w_desc" "- External draft model file for speculation" "$w_res"
         if [ "$S_MIROSTAT" == "0" ]; then
-        printf "%-3s %-25s %-22s %b%s%b\n" "19)" "XTC Probability" "[$S_XTC_PROB]" "$w_desc" "- Exclude Top Choices prob (0.0 = off, 0.2 = recommended)" "$w_res"
-        printf "%-3s %-25s %-22s %b%s%b\n" "20)" "XTC Threshold" "[$S_XTC_THRESH]" "$w_desc" "- Threshold for XTC triggering (default 0.1)" "$w_res"
+        printf "%-3s %-25s %-22s %b%s%b\n" "19)" "XTC Probability" "[$S_XTC_PROB]" "$w_desc" "- Exclude Top Choices prob (0.0 = off, default; 0.2 = recommended)" "$w_res"
+        printf "%-3s %-25s %-22s %b%s%b\n" "20)" "XTC Threshold" "[$S_XTC_THRESH]" "$w_desc" "- Threshold for XTC triggering (only used when XTC on)" "$w_res"
         fi
         printf "%-3s %-25s %-22s %b%s%b\n" "S)" "Save & Exit" "" "" "" ""
         printf "%-3s %-25s %-22s %b%s%b\n" "R)" "Save & Run Model" "" "" "" ""
