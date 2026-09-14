@@ -1332,6 +1332,61 @@ install_mykyagent() {
     (cd "$MYKYAGENT_DIR" && ./install.sh)
 }
 
+# --- remote endpoint registry -------------------------------------------------
+# Remembers every llama-server host used with -ma/-dh/etc: baseUrl, apiKey and
+# the model ids last seen there, so /model pickers show real names and stale
+# entries stay usable when a host is temporarily down.
+REMOTES_FILE="$CONFIG_DIR/remotes.json"
+
+remote_provider_key() {
+    # host[:port] -> stable provider key, e.g. llama-192_168_0_147 or llama-192_168_0_147-8081
+    local h="$1"
+    h="${h//./_}"
+    h="${h//:/-}"
+    echo "llama-$h"
+}
+
+# Print model ids an llama-server exposes (one per line). Empty on failure.
+probe_remote_models() {
+    local url="$1" key="$2"
+    curl -s --max-time 3 -H "Authorization: Bearer $key" "$url/models" | node -e '
+    let d = "";
+    process.stdin.on("data", c => d += c);
+    process.stdin.on("end", () => {
+        try {
+            const j = JSON.parse(d);
+            const raw = j.data || j.models || [];
+            const ids = raw.map(m => m.id || m.model || m.name).filter(Boolean).map(String);
+            console.log([...new Set(ids)].join("\n"));
+        } catch (e) { /* unreachable server or bad payload -> empty */ }
+    });' 2>/dev/null
+}
+
+remotes_upsert() {
+    # host base_url api_key model_id...
+    local host="$1" base_url="$2" key="$3"; shift 3
+    node -e '
+    const fs = require("fs");
+    const [host, baseUrl, apiKey, ...models] = process.argv.slice(1);
+    const path = process.env.REMOTES_FILE;
+    let reg = {};
+    try { if (fs.existsSync(path)) reg = JSON.parse(fs.readFileSync(path, "utf8")); } catch (e) {}
+    reg[host] = { baseUrl, apiKey, models, updated: new Date().toISOString() };
+    fs.writeFileSync(path, JSON.stringify(reg, null, 2));
+    ' "$host" "$base_url" "$key" "$@" 2>/dev/null
+}
+
+remotes_get_models() {
+    # host -> remembered model ids, one per line
+    node -e '
+    const fs = require("fs");
+    try {
+        const reg = JSON.parse(fs.readFileSync(process.env.REMOTES_FILE, "utf8"));
+        console.log((reg[process.argv[1]]?.models || []).join("\n"));
+    } catch (e) {}
+    ' "$1" 2>/dev/null
+}
+
 run_mykyagent_standalone() {
     if [ ! -x "$MYKYAGENT_DIR/bin/mykyagent" ] || (! command -v pi &> /dev/null && [ ! -x "$PI_DIR/node_modules/.bin/pi" ]); then
         echo "MykyAgent or Pi runner is not ready locally."
@@ -1342,12 +1397,16 @@ run_mykyagent_standalone() {
 
     local remote_host="$1"
     local base_url
+    local provider_key="llama-local"
+    local is_remote=0
     if [ -n "$remote_host" ]; then
         if [[ "$remote_host" == *:* ]]; then
             base_url="http://$remote_host/v1"
         else
             base_url="http://$remote_host:8080/v1"
         fi
+        provider_key=$(remote_provider_key "$remote_host")
+        is_remote=1
         echo "[MykyAgent] Connecting to remote server at $base_url"
     else
         base_url="http://localhost:8080/v1"
@@ -1356,10 +1415,11 @@ run_mykyagent_standalone() {
     export MYKYAGENT_BASE_URL="$base_url"
     export MYKYAGENT_API_KEY="$API_KEY"
     export MODELS_FILE="$HOME/.pi/agent/models.json"
+    export REMOTES_FILE="$REMOTES_FILE"
     if [ -n "$selected_alias" ]; then
         export SELECTED_ALIAS="$selected_alias"
     elif [ -n "$remote_host" ]; then
-        export SELECTED_ALIAS="remote"
+        export SELECTED_ALIAS=""
     else
         export SELECTED_ALIAS=""
     fi
@@ -1368,8 +1428,36 @@ run_mykyagent_standalone() {
 
     mkdir -p "$HOME/.pi/agent"
 
-    if [ -z "$SELECTED_CTX" ] && [ -n "$SELECTED_ALIAS" ]; then
+    if [ -z "$SELECTED_CTX" ] && [ -n "$BASE_URL" ]; then
         probe_remote_ctx "$BASE_URL" "$API_KEY"
+    fi
+
+    # For remote hosts: probe the real model list, remember host+key+models in
+    # the registry, and register a dedicated per-host provider so the /model
+    # picker shows real names instead of a generic "remote" placeholder.
+    local remote_models_csv=""
+    if [ "$is_remote" = 1 ]; then
+        local probed
+        probed=$(probe_remote_models "$BASE_URL" "$API_KEY")
+        if [ -n "$probed" ]; then
+            remote_models_csv=$(echo "$probed" | paste -sd, -)
+            remotes_upsert "$remote_host" "$base_url" "$API_KEY" $probed
+        else
+            remote_models_csv=$(remotes_get_models "$remote_host" | paste -sd, -)
+            if [ -n "$remote_models_csv" ]; then
+                echo "[MykyAgent] Server unreachable, using remembered models: $remote_models_csv"
+            else
+                remote_models_csv="remote"
+                echo "[MykyAgent] Server unreachable and nothing remembered; falling back to generic model entry."
+            fi
+        fi
+        export REMOTE_MODELS_CSV="$remote_models_csv"
+        export REMOTE_PROVIDER_KEY="$provider_key"
+        export REMOTE_HOST_LABEL="$remote_host"
+    else
+        export REMOTE_MODELS_CSV=""
+        export REMOTE_PROVIDER_KEY=""
+        export REMOTE_HOST_LABEL=""
     fi
 
     node -e '
@@ -1379,6 +1467,10 @@ run_mykyagent_standalone() {
     const ctx = parseInt(process.env.SELECTED_CTX) || 128000;
     const baseUrl = process.env.BASE_URL;
     const apiKey = process.env.API_KEY || "dummy";
+    const isRemote = process.env.REMOTE_PROVIDER_KEY ? true : false;
+    const providerKey = isRemote ? process.env.REMOTE_PROVIDER_KEY : "llama-local";
+    const hostLabel = process.env.REMOTE_HOST_LABEL || "localhost";
+    const remoteModels = (process.env.REMOTE_MODELS_CSV || "").split(",").filter(Boolean);
 
     let cfg = { providers: {} };
     try {
@@ -1390,14 +1482,7 @@ run_mykyagent_standalone() {
     }
 
     cfg.providers = cfg.providers || {};
-    cfg.providers["llama-local"] = {
-        baseUrl: baseUrl,
-        api: "openai-completions",
-        apiKey: apiKey,
-        models: cfg.providers["llama-local"]?.models || []
-    };
 
-    const models = cfg.providers["llama-local"].models;
     const maxOut = Math.floor(ctx * 0.5);
     const isQwen = /qwen/i.test(alias);
     const thinkingLevelMap = isQwen ? {
@@ -1418,26 +1503,62 @@ run_mykyagent_standalone() {
         max: "max"
     };
 
-    if (alias) {
-        const existing = models.find(m => m.id === alias);
-        const modelEntry = {
-            contextWindow: ctx,
-            maxTokens: maxOut,
-            reasoning: true,
-            compat: {
-                supportsReasoningEffort: true,
-                requiresThinkingAsText: true
-            },
-            thinkingLevelMap: thinkingLevelMap
+    const modelEntry = {
+        contextWindow: ctx,
+        maxTokens: maxOut,
+        reasoning: true,
+        compat: {
+            supportsReasoningEffort: true,
+            requiresThinkingAsText: true
+        },
+        thinkingLevelMap: thinkingLevelMap
+    };
+
+    if (isRemote) {
+        // Dedicated provider per host. Its baseUrl/apiKey never clobber other
+        // hosts, so remembered entries stay valid when switching back and forth.
+        cfg.providers[providerKey] = {
+            baseUrl: baseUrl,
+            api: "openai-completions",
+            apiKey: apiKey,
+            models: cfg.providers[providerKey]?.models || []
         };
-        if (existing) {
-            Object.assign(existing, modelEntry);
-        } else {
-            models.push({
-                id: alias,
-                name: "Local: " + alias,
-                ...modelEntry
-            });
+        const models = cfg.providers[providerKey].models;
+        for (const rawId of remoteModels) {
+            const pretty = String(rawId).split("/").pop().replace(/\.gguf$/i, "");
+            const existing = models.find(m => m.id === rawId || m.id === pretty);
+            const entry = { id: rawId, name: `Remote ${hostLabel}: ${pretty}`, ...modelEntry };
+            if (existing) {
+                Object.assign(existing, entry);
+            } else {
+                models.push(entry);
+            }
+        }
+        // Keep only ids still offered by this host (or remembered for it).
+        const keep = new Set(remoteModels);
+        const keepPretty = new Set(remoteModels.map(r => String(r).split("/").pop().replace(/\.gguf$/i, "")));
+        cfg.providers[providerKey].models = models.filter(m => keep.has(m.id) || keepPretty.has(m.id));
+    } else {
+        cfg.providers["llama-local"] = {
+            baseUrl: baseUrl,
+            api: "openai-completions",
+            apiKey: apiKey,
+            // Prune the legacy generic "remote" placeholder; remote hosts now
+            // get their own per-host providers.
+            models: (cfg.providers["llama-local"]?.models || []).filter(m => m.id !== "remote")
+        };
+        const models = cfg.providers["llama-local"].models;
+        if (alias) {
+            const existing = models.find(m => m.id === alias);
+            if (existing) {
+                Object.assign(existing, modelEntry);
+            } else {
+                models.push({
+                    id: alias,
+                    name: "Local: " + alias,
+                    ...modelEntry
+                });
+            }
         }
     }
 
@@ -1446,7 +1567,18 @@ run_mykyagent_standalone() {
 
     local AGENT_BIN="$MYKYAGENT_DIR/bin/mykyagent"
 
-    if [ -n "$SELECTED_ALIAS" ]; then
+    if [ "$is_remote" = 1 ]; then
+        # Prefer the alias chosen in the model menu if it exists on this host,
+        # otherwise the first model the server actually exposes.
+        local launch_model_id=""
+        if [ -n "$selected_alias" ] && echo ",$(echo "$remote_models_csv" | sed 's/[^,]*\///g;s/\.gguf//gi'),$remote_models_csv" | grep -qi "$selected_alias"; then
+            launch_model_id=$(echo "$remote_models_csv" | tr ',' '\n' | grep -i "$selected_alias" | head -n 1)
+        else
+            launch_model_id=$(echo "$remote_models_csv" | cut -d, -f1)
+        fi
+        echo "Starting MykyAgent with model: $provider_key/$launch_model_id"
+        "$AGENT_BIN" --model "$provider_key/$launch_model_id" "${EXTRA_ARGS[@]}"
+    elif [ -n "$SELECTED_ALIAS" ]; then
         echo "Starting MykyAgent with model: $SELECTED_ALIAS"
         "$AGENT_BIN" --model "llama-local/$SELECTED_ALIAS" "${EXTRA_ARGS[@]}"
     else
