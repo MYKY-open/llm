@@ -289,7 +289,7 @@ ${c_bold}${c_cyan}Configuration & Engine Maintenance:${c_reset}
   ${c_green}-vram, --vram <MB>${c_reset}        Temporarily override the MAX_VRAM_MB auto-offload limit
   ${c_green}-p,  --patch <file>${c_reset}       Apply a .patch file to the active llama.cpp backend
   ${c_green}-i,  --install${c_reset}            Clone, build, and install llama.cpp & backends
-  ${c_green}-u,  --upgrade${c_reset}            Upgrade all components and engines
+  ${c_green}-u,  --upgrade${c_reset}            Upgrade all components and engines (works without a local engine)
   ${c_green}-f,  --force${c_reset}              Forcefully discard local changes during update/install
   ${c_green}-c,  --compile${c_reset}            Only compile native kernels
   ${c_green}-C,  --configure${c_reset}          Run ccmake for configuration
@@ -462,18 +462,24 @@ compile_all() {
 }
 
 upgrade_llm_core() {
-    echo "Upgrading llama.cpp ($ACTIVE_BACKEND)..."
-    [ ! -d "$LLAMA_DIR" ] && { echo "llama.cpp not installed!"; exit 1; }
-    cd "$LLAMA_DIR" || exit
-    if [ "$FORCE_RESET" == "1" ]; then
-        git reset --hard HEAD
-        git clean -fd
-        git pull
+    if [ -d "$LLAMA_DIR" ]; then
+        (
+            echo "Upgrading llama.cpp ($ACTIVE_BACKEND)..."
+            cd "$LLAMA_DIR" || exit 1
+            if [ "$FORCE_RESET" == "1" ]; then
+                git reset --hard HEAD
+                git clean -fd
+                git pull
+            else
+                git pull --rebase --autostash
+            fi
+            git submodule update --init --recursive --depth 1
+            compile_llm_core
+        )
     else
-        git pull --rebase --autostash
+        echo "llama.cpp ($ACTIVE_BACKEND) not installed - skipping local engine upgrade."
+        echo "This is fine for API/cloud users. Install a local engine anytime with: llm -i"
     fi
-    git submodule update --init --recursive --depth 1
-    compile_llm_core
 
     if [ -d "$SCRIPT_DIR/.git" ]; then
         echo "Upgrading llm orchestrator..."

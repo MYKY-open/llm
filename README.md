@@ -15,6 +15,7 @@ A terminal management script and orchestrator for `llama.cpp` and local AI inter
   - **SillyTavern** / **Odysseus** / **DeepSeek Harness** / **Little-coder**
 - **Dynamic Model Injection**: Automatically probes active `llama-server` models, context windows, and reasoning configs for connected agents.
 - **Unified Updates**: Upgrades `llama.cpp`, submodules, recompiles kernels, and updates all installed frontends via `llm -u`.
+  API/cloud users with no local engine can still run `llm -u` — it skips the missing engine and just updates the orchestrator and installed frontends.
 
 ## Usage
 
