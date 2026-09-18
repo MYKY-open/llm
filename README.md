@@ -3,7 +3,7 @@
 A terminal management script and orchestrator for `llama.cpp` and local AI interfaces.
 
 ## Features
-- **Multi-Backend Engine**: Switch seamlessly between `mainline`, `ikllamacpp` (CUDA optimized), and `beellamacpp`.
+- **Multi-Backend Engine**: Switch seamlessly between `mainline`, `ikllamacpp` (CUDA optimized), `beellamacpp`, and `prismllamacpp` (PrismML fork: PQ2_0 low-bit format + dspark speculative decoding for Bonsai models).
 - **Auto-NGL VRAM Calculation**: Automatically reads GGUF block structures and computes optimal GPU layer offload (`-ngl`) to fit your available VRAM.
 - **Frontend Hub**: Launch and manage multiple interfaces:
   - **CLI**: Interactive terminal (`llama-cli`)

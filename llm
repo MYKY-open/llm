@@ -152,6 +152,13 @@ case "$ACTIVE_BACKEND" in
         # output.weight is 1940 MiB which always exceeds Vulkan's 1GB buffer limit and hard-crashes.
         DEFAULT_MODEL_ARGS="-rtr --no-warmup -fa on -ctk q8_0 -ctv q8_0 --device none -t $PHYSICAL_CORES -tb $PHYSICAL_CORES -ub 1024 $LLM_DEFAULTS"
         ;;
+    prismllamacpp)
+        LLAMA_REPO="https://github.com/PrismML-Eng/llama.cpp.git"
+        # PrismML fork (branch 'prism'): tracks mainline, adds PQ2_0 low-bit format
+        # (~6% smaller than group-64 Q2_0) and dspark speculative decoding for Bonsai models.
+        # Do NOT mix this fork's ggml-* libraries with stock llama.cpp builds.
+        DEFAULT_MODEL_ARGS="--poll 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 -t $PHYSICAL_CORES -tb $PHYSICAL_CORES --cpu-strict 1 -ub 1024 $LLM_DEFAULTS"
+        ;;
     beellamacpp)
         LLAMA_REPO="https://github.com/Anbeeld/beellama.cpp.git"
         # beellamacpp-specific extras:
@@ -514,11 +521,11 @@ configure_llm() {
 }
 
 switch_backend() {
-    local backend_menu="1) mainline (fastest model support, universal, slowest)\n2) ikllamacpp (slowest model support, fastest for cuda only)\n3) beellamacpp (good model support, universal, fast)"
+    local backend_menu="1) mainline (fastest model support, universal, slowest)\n2) ikllamacpp (slowest model support, fastest for cuda only)\n3) beellamacpp (good model support, universal, fast)\n4) prismllamacpp (PrismML fork: PQ2_0 low-bit + dspark spec decoding, Bonsai models)"
     local selected=$(echo -e "$backend_menu" | fzf_with_usage backends --prompt="Select Backend > " | awk '{print $2}')
     [ -z "$selected" ] && return
     
-    if [[ "$selected" =~ ^(mainline|ikllamacpp|beellamacpp)$ ]]; then
+    if [[ "$selected" =~ ^(mainline|ikllamacpp|beellamacpp|prismllamacpp)$ ]]; then
         echo "$selected" > "$ACTIVE_BACKEND_FILE"
         echo "Active backend set to: $selected"
     else
@@ -706,6 +713,7 @@ EOF
                 case "$ACTIVE_BACKEND" in
                     ikllamacpp) DEFAULT_MODEL_ARGS="-rtr --no-warmup -fa on -ctk q8_0 -ctv q8_0 --device none -t $PHYSICAL_CORES -tb $PHYSICAL_CORES -ub 1024 $LLM_DEFAULTS" ;;
                     beellamacpp) DEFAULT_MODEL_ARGS="--poll 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --reasoning-loop-guard force-close -t $PHYSICAL_CORES -tb $PHYSICAL_CORES --cpu-strict 1 -ub 2048 $LLM_DEFAULTS" ;;
+                    prismllamacpp) DEFAULT_MODEL_ARGS="--poll 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 -t $PHYSICAL_CORES -tb $PHYSICAL_CORES --cpu-strict 1 -ub 1024 $LLM_DEFAULTS" ;;
                     *) DEFAULT_MODEL_ARGS="--poll 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 -t $PHYSICAL_CORES -tb $PHYSICAL_CORES --cpu-strict 1 -ub 1024 $LLM_DEFAULTS" ;;
                 esac
                 run_model
