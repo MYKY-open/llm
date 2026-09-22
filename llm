@@ -306,12 +306,22 @@ ${c_bold}${c_cyan}Script Options:${c_reset}
   ${c_green}-is, --install-script${c_reset}     Update or install this script system-wide
   ${c_green}-e,  --edit${c_reset}               Edit this script using \$EDITOR
   ${c_green}-h,  --help${c_reset}               Display this help message
+  ${c_green}-hh, --llama-help${c_reset}         Display llama-server backend help
 
 ${c_bold}${c_cyan}Examples:${c_reset}
   llm ${c_green}-he 192.168.1.100${c_reset}     Launch Hermes connected to a remote remote server
   llm ${c_green}-vram 8192${c_reset}            Launch interactive menu, capping VRAM at 8GB
   llm                       Launch the interactive model picker menu
 "
+}
+
+print_llama_help() {
+    if [ -x "$LLAMA_DIR/build/bin/llama-server" ]; then
+        "$LLAMA_DIR/build/bin/llama-server" --help 2>&1 | ${PAGER:-less -R}
+    else
+        echo "Error: llama-server binary not found at $LLAMA_DIR/build/bin/llama-server"
+        return 1
+    fi
 }
 
 cleanup() {
@@ -1926,6 +1936,7 @@ case "$1" in
     -o|--run-ooba)    EXTRA_ARGS=("${@:2}"); run_oobabooga ;;
     -O|--run-odys)    EXTRA_ARGS=("${@:2}"); run_odysseus_standalone ;;
     -h|--help)        EXTRA_ARGS=("${@:2}"); print_help ;;
+    -hh|--llama-help) EXTRA_ARGS=("${@:2}"); print_llama_help ;;
     -Re|--reset)      EXTRA_ARGS=("${@:2}"); reset_llm ;;
     -C|--configure)   EXTRA_ARGS=("${@:2}"); configure_llm ;;
     -m|--modellistedit) EXTRA_ARGS=("${@:2}"); $EDITOR "$MODEL_LIST_FILE" ;;
