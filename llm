@@ -1,7 +1,11 @@
 #!/bin/bash
 # =============================================================================
 # llm - A management script for llama.cpp
+# License: WTFPL (see LICENSE file). Do what you want.
 # =============================================================================
+# USER CONFIG: edit the block below (paths, repos, EDITOR, API_KEY) to fit
+# your machine. Everything below that block is engine — leave it alone.
+# Updates are MANUAL ONLY (`llm -u`). Launches never git-pull.
 
 SCRIPT_PATH="$(readlink -f "$BASH_SOURCE")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
@@ -53,10 +57,10 @@ BUILD_THREADS=$(nproc 2>/dev/null || echo "$PHYSICAL_CORES")  # all logical core
 export BLIS_NUM_THREADS=$PHYSICAL_CORES
 export OMP_NUM_THREADS=$PHYSICAL_CORES
 
-# Configuration
+# Configuration (USER-EDITABLE placeholders — change to fit your machine)
 EDITOR=kate
 SUDO=sudo
-API_KEY="cannotguess"
+API_KEY="cannotguess" # placeholder default, edit me; can also come from env
 CMAKE_COMPILER_ARGS=()
 BUILDOPT=()
 
@@ -510,7 +514,7 @@ upgrade_llm_core() {
     [ -x "$CODEHAMR_DIR/codehamr" ] && install_codehamr
     [ -x "$HOME/.opencode/bin/opencode" ] && install_opencode
     [ -d "$PI_DIR" ] && install_pi
-    [ -d "$LITTLECODER_DIR" ] && install_littlecoder
+    [ -d "$LITTLECODER_DIR" ] && (cd "$LITTLECODER_DIR" && git pull --rebase --autostash)
     [ -d "$MYKYAGENT_DIR" ] && (cd "$MYKYAGENT_DIR" && git pull --rebase --autostash)
 }
 
@@ -1342,7 +1346,7 @@ install_mykyagent() {
 
     mkdir -p "$(dirname "$MYKYAGENT_DIR")"
     if [ -d "$MYKYAGENT_DIR/.git" ]; then
-        (cd "$MYKYAGENT_DIR" && git pull --rebase --autostash)
+        echo "MykyAgent already cloned, reusing as-is (update manually with: llm -u)."
     else
         rm -rf "$MYKYAGENT_DIR"
         git clone --depth 1 "$MYKYAGENT_REPO" "$MYKYAGENT_DIR"
@@ -1409,8 +1413,6 @@ run_mykyagent_standalone() {
     if [ ! -x "$MYKYAGENT_DIR/bin/mykyagent" ] || (! command -v pi &> /dev/null && [ ! -x "$PI_DIR/node_modules/.bin/pi" ]); then
         echo "MykyAgent or Pi runner is not ready locally."
         install_mykyagent || return 1
-    elif [ -d "$MYKYAGENT_DIR/.git" ]; then
-        (cd "$MYKYAGENT_DIR" && git pull --rebase --autostash -q 2>/dev/null || true)
     fi
 
     local remote_host="$1"
@@ -1617,7 +1619,7 @@ install_littlecoder() {
         return 1
     fi
     if [ -d "$LITTLECODER_DIR/.git" ]; then
-        (cd "$LITTLECODER_DIR" && git pull --rebase --autostash)
+        echo "little-coder already cloned, reusing as-is (update manually with: llm -u)."
     else
         rm -rf "$LITTLECODER_DIR"
         git clone --depth 1 "https://github.com/itayinbarr/little-coder.git" "$LITTLECODER_DIR"
