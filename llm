@@ -384,7 +384,8 @@ start_llama_server() {
     local extra_args=()
     [ -n "$selected_alias" ] && extra_args=("--alias" "$selected_alias")
     
-    run_pinned "$LLAMA_DIR/build/bin/llama-server" -m "$selected_path" "${extra_args[@]}" $SERVER_ARGS $final_args --port "$port" > "$BASE_DIR/llama-server.log" 2>&1 &
+    _srv_args=$(dedupe_last "${extra_args[@]}" $SERVER_ARGS $final_args --port "$port")
+    run_pinned "$LLAMA_DIR/build/bin/llama-server" -m "$selected_path" $_srv_args > "$BASE_DIR/llama-server.log" 2>&1 &
     llama_pid=$!
     
     echo -n "Waiting for server to be ready..."
@@ -1786,6 +1787,42 @@ run_odysseus_standalone() {
 }
 
 
+# last occurrence wins for single-value flags (lets `llm -ub 4096` override defaults)
+# usage: dedupe_last <args...>
+dedupe_last() {
+    python3 - "$@" <<'PYEOF'
+import sys
+VALFLAGS = {"-ub","--ubatch","--ubatch-size","-b","--batch","-c","--ctx-size",
+ "-t","--threads","-tb","--threads-batch","-ngl","--n-gpu-layers",
+ "--port","--host","-m","--model","--mmproj","--alias","-lcd","--slot-save-path"}
+args = sys.argv[1:]
+units = []  # (flag|None, [tokens])
+i = 0
+while i < len(args):
+    a = args[i]
+    base = a.split("=", 1)[0]
+    if base in VALFLAGS and "=" not in a and i + 1 < len(args):
+        units.append((base, [a, args[i+1]])); i += 2
+    elif base in VALFLAGS:
+        units.append((base, [a])); i += 1
+    else:
+        units.append((None, [a])); i += 1
+last = {}
+for idx, (f, _) in enumerate(units):
+    if f: last[f] = idx
+out = []
+seen_bool = set()
+for idx, (f, toks) in enumerate(units):
+    if f:
+        if last[f] == idx: out.extend(toks)
+    elif len(toks) == 1 and toks[0] in ("--embeddings", "--embedding"):
+        if "emb" not in seen_bool: out.extend(toks); seen_bool.add("emb")
+    else:
+        out.extend(toks)
+print(" ".join(out))
+PYEOF
+}
+
 run_model() {
 
     [ ! -f "$MODEL_LIST_FILE" ] && { echo "No models!"; exit 1; }
@@ -1795,6 +1832,22 @@ run_model() {
     local index=$(echo "$selected" | awk '{print $1}' | tr -d ')')
     IFS='|' read -r selected_alias selected_path selected_custom <<< "$(sed "${index}q;d" "$MODEL_LIST_FILE")"
     final_args="$DEFAULT_MODEL_ARGS $selected_custom ${EXTRA_ARGS[*]}"
+    # embed models: server clamps ubatch to batch, so raise BOTH (else -ub 8096 -> 2048)
+    # full 1120 image tokens need ub ~2300+; use 4096/4096 unless user overrode
+    _lname=$(basename "$selected_path" | tr 'A-Z' 'a-z')
+    case "$_lname" in *embed*)
+        case " $selected_custom ${EXTRA_ARGS[*]} " in *" -ub "*|*" --ubatch"*) ;;
+            *) final_args=$(echo "$final_args" | sed -E 's/(^| )-ub [0-9]+/\1-ub 4096/') ;;
+        esac
+        case " $selected_custom ${EXTRA_ARGS[*]} " in *" -b "*|*" --batch"*) ;;
+            *) final_args=$(echo "$final_args" | sed -E 's/(^| )-b [0-9]+/\1-b 4096/')
+               case " $final_args " in *" -b "*) ;; *) final_args="-b 4096 $final_args" ;; esac ;;
+        esac
+        case " $final_args " in *" --embedding"*) ;; *) final_args="$final_args --embeddings" ;; esac
+        ;;
+    esac
+    # user override wins, drop earlier dupes (kills '-ub specified multiple times')
+    final_args=$(dedupe_last $final_args)
 
     # Setup model-specific speculative decoding lookup cache
     local safe_alias=$(echo "$selected_alias" | tr -dc 'a-zA-Z0-9_-')
