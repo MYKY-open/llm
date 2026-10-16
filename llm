@@ -47,15 +47,35 @@ MYKYAGENT_REPO="https://github.com/MYKY-open/mykyagent.git"
 OPENCODE_DIR="$BASE_DIR/opencode"
 CODEHAMR_DIR="$BASE_DIR/codehamr"
 
-# System Resources
+# System Resources - dynamic, works on any core count (phone 4c .. desktop 16c)
 if command -v lscpu &> /dev/null; then
-    PHYSICAL_CORES=$(lscpu -b -p=Core,Socket | grep -v '^#' | sort -u | wc -l)
+    PHYSICAL_CORES=$(lscpu -b -p=Core,Socket 2>/dev/null | grep -v '^#' | sort -u | wc -l)
 else
     PHYSICAL_CORES=$(nproc 2>/dev/null || echo 4)
 fi
+# sanity clamp
+[ "$PHYSICAL_CORES" -lt 2 ] 2>/dev/null && PHYSICAL_CORES=2
 BUILD_THREADS=$(nproc 2>/dev/null || echo "$PHYSICAL_CORES")  # all logical cores for compilation
-export BLIS_NUM_THREADS=$PHYSICAL_CORES
-export OMP_NUM_THREADS=$PHYSICAL_CORES
+# leave 1 physical core free for system/UI. gen takes rest, batch takes half.
+GEN_THREADS=$((PHYSICAL_CORES - 1))
+[ "$GEN_THREADS" -lt 2 ] && GEN_THREADS=2
+BATCH_THREADS=$(((GEN_THREADS + 1) / 2))
+[ "$BATCH_THREADS" -lt 2 ] && BATCH_THREADS=2
+[ "$BATCH_THREADS" -gt "$GEN_THREADS" ] && BATCH_THREADS=$GEN_THREADS
+export BLIS_NUM_THREADS=$GEN_THREADS
+export OMP_NUM_THREADS=$GEN_THREADS
+export OMP_WAIT_POLICY=PASSIVE
+export GOMP_SPINCOUNT=0
+# PIN_CPUS: one Linux CPU per physical core, last core dropped (free for system).
+# Handles x86 SMT (0-1=same core) and ARM no-SMT (each CPU own core) both.
+PIN_CPUS=""
+if command -v lscpu &> /dev/null; then
+    PIN_CPUS=$(lscpu -b -p=CPU,Core,Socket 2>/dev/null | grep -v '^#' | awk -F, '{if (!seen[$2","$3]++) print $1}' | head -n "$GEN_THREADS" | paste -sd, -)
+fi
+if [ -z "$PIN_CPUS" ]; then
+    # fallback: 0..GEN-1
+    PIN_CPUS=$(seq -s, 0 $((GEN_THREADS - 1)))
+fi
 
 # Configuration (USER-EDITABLE placeholders — change to fit your machine)
 EDITOR=kate
@@ -152,33 +172,35 @@ case "$ACTIVE_BACKEND" in
     ikllamacpp)
         LLAMA_REPO="https://github.com/ikawrakow/ik_llama.cpp.git"
         # ikllamacpp is highly optimized for CPU inference with its own FlashMLA implementation.
-        # --device none: ikllamacpp Vulkan lacks the large-tensor fallback that mainline/beellama have;
+        #: ikllamacpp Vulkan lacks the large-tensor fallback that mainline/beellama have;
         # output.weight is 1940 MiB which always exceeds Vulkan's 1GB buffer limit and hard-crashes.
-        DEFAULT_MODEL_ARGS="-rtr --no-warmup -fa on -ctk q8_0 -ctv q8_0 --device none -t $PHYSICAL_CORES -tb $PHYSICAL_CORES -ub 1024 $LLM_DEFAULTS"
+        DEFAULT_MODEL_ARGS="-rtr --no-warmup -fa on -ctk q8_0 -ctv q8_0 --load-mode mmap --lazy-mode on --poll 0 --poll-batch 0 --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $BATCH_THREADS -ub 1024 $LLM_DEFAULTS"
         ;;
     prismllamacpp)
         LLAMA_REPO="https://github.com/PrismML-Eng/llama.cpp.git"
         # PrismML fork (branch 'prism'): tracks mainline, adds PQ2_0 low-bit format
         # (~6% smaller than group-64 Q2_0) and dspark speculative decoding for Bonsai models.
         # Do NOT mix this fork's ggml-* libraries with stock llama.cpp builds.
-        DEFAULT_MODEL_ARGS="--poll 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 -t $PHYSICAL_CORES -tb $PHYSICAL_CORES --cpu-strict 1 -ub 1024 $LLM_DEFAULTS"
+        DEFAULT_MODEL_ARGS="--poll 0 --poll-batch 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --load-mode mmap --lazy-mode on --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $BATCH_THREADS -ub 1024 $LLM_DEFAULTS"
         ;;
     beellamacpp)
         LLAMA_REPO="https://github.com/Anbeeld/beellama.cpp.git"
         # beellamacpp-specific extras:
         #   --reasoning-loop-guard : auto force-closes infinite thinking loops on reasoning models
         #   -ub 2048               : beellama handles larger ubatch well, helps PP throughput
-        DEFAULT_MODEL_ARGS="--poll 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --reasoning-loop-guard force-close -t $PHYSICAL_CORES -tb $PHYSICAL_CORES --cpu-strict 1 -ub 2048 $LLM_DEFAULTS"
+        DEFAULT_MODEL_ARGS="--poll 0 --poll-batch 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --reasoning-loop-guard force-close --load-mode mmap --lazy-mode on --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $BATCH_THREADS -ub 2048 $LLM_DEFAULTS"
         ;;
     *)
         LLAMA_REPO="https://github.com/ggerganov/llama.cpp.git"
-        # Mainline llama.cpp defaults.
-        DEFAULT_MODEL_ARGS="--poll 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 -t $PHYSICAL_CORES -tb $PHYSICAL_CORES --cpu-strict 1 -ub 1024 $LLM_DEFAULTS"
+        # Mainline llama.cpp defaults. CPU-only (no Vulkan copy = fast load), mmap+lazy, no spin.
+        DEFAULT_MODEL_ARGS="--poll 0 --poll-batch 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --load-mode mmap --lazy-mode on --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $BATCH_THREADS -ub 1024 $LLM_DEFAULTS"
         ;;
 esac
 
 # Server-mode extra flags (applied on top of defaults for server modes)
-SERVER_ARGS="--slot-save-path $BASE_DIR/cache --jinja"
+# --slot-save-path only enables manual /slots/save API, no auto-save.
+# --jinja explicit on (default on anyway). --parallel 1 + sleep = low RAM + idle 0% CPU.
+SERVER_ARGS="--slot-save-path $BASE_DIR/cache --jinja --parallel 1 --sleep-idle-seconds 600"
 
 # Lists / Config Directory
 CONFIG_DIR="$BASE_DIR/config"
@@ -352,10 +374,10 @@ ensure_repo() {
 }
 
 run_pinned() {
-    # Hard-pin the process to the first physical cores to prevent thread hopping
-    if command -v taskset &> /dev/null; then
-        local TASKSET_CMD=(taskset -c 0-$((PHYSICAL_CORES-1)))
-        exec "${TASKSET_CMD[@]}" "$@"
+    # Dynamic pin: $PIN_CPUS = one thread per core, 1 core left free.
+    # exec keeps PID stable so kill $llama_pid works.
+    if command -v taskset &> /dev/null && [ -n "$PIN_CPUS" ]; then
+        exec taskset -c "$PIN_CPUS" "$@"
     else
         exec "$@"
     fi
@@ -384,7 +406,7 @@ start_llama_server() {
     local extra_args=()
     [ -n "$selected_alias" ] && extra_args=("--alias" "$selected_alias")
     
-    _srv_args=$(dedupe_last "${extra_args[@]}" $SERVER_ARGS $final_args --port "$port")
+    _srv_args="${extra_args[*]} $SERVER_ARGS $final_args --port $port"
     run_pinned "$LLAMA_DIR/build/bin/llama-server" -m "$selected_path" $_srv_args > "$BASE_DIR/llama-server.log" 2>&1 &
     llama_pid=$!
     
@@ -726,10 +748,10 @@ EOF
                 fi
                 # We need to re-apply it to the active backend args
                 case "$ACTIVE_BACKEND" in
-                    ikllamacpp) DEFAULT_MODEL_ARGS="-rtr --no-warmup -fa on -ctk q8_0 -ctv q8_0 --device none -t $PHYSICAL_CORES -tb $PHYSICAL_CORES -ub 1024 $LLM_DEFAULTS" ;;
-                    beellamacpp) DEFAULT_MODEL_ARGS="--poll 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --reasoning-loop-guard force-close -t $PHYSICAL_CORES -tb $PHYSICAL_CORES --cpu-strict 1 -ub 2048 $LLM_DEFAULTS" ;;
-                    prismllamacpp) DEFAULT_MODEL_ARGS="--poll 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 -t $PHYSICAL_CORES -tb $PHYSICAL_CORES --cpu-strict 1 -ub 1024 $LLM_DEFAULTS" ;;
-                    *) DEFAULT_MODEL_ARGS="--poll 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 -t $PHYSICAL_CORES -tb $PHYSICAL_CORES --cpu-strict 1 -ub 1024 $LLM_DEFAULTS" ;;
+                    ikllamacpp) DEFAULT_MODEL_ARGS="-rtr --no-warmup -fa on -ctk q8_0 -ctv q8_0 --load-mode mmap --lazy-mode on --poll 0 --poll-batch 0 --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $BATCH_THREADS -ub 1024 $LLM_DEFAULTS" ;;
+                    beellamacpp) DEFAULT_MODEL_ARGS="--poll 0 --poll-batch 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --reasoning-loop-guard force-close --load-mode mmap --lazy-mode on --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $BATCH_THREADS -ub 2048 $LLM_DEFAULTS" ;;
+                    prismllamacpp) DEFAULT_MODEL_ARGS="--poll 0 --poll-batch 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --load-mode mmap --lazy-mode on --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $BATCH_THREADS -ub 1024 $LLM_DEFAULTS" ;;
+                    *) DEFAULT_MODEL_ARGS="--poll 0 --poll-batch 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --load-mode mmap --lazy-mode on --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $BATCH_THREADS -ub 1024 $LLM_DEFAULTS" ;;
                 esac
                 run_model
                 break
@@ -1787,42 +1809,6 @@ run_odysseus_standalone() {
 }
 
 
-# last occurrence wins for single-value flags (lets `llm -ub 4096` override defaults)
-# usage: dedupe_last <args...>
-dedupe_last() {
-    python3 - "$@" <<'PYEOF'
-import sys
-VALFLAGS = {"-ub","--ubatch","--ubatch-size","-b","--batch","-c","--ctx-size",
- "-t","--threads","-tb","--threads-batch","-ngl","--n-gpu-layers",
- "--port","--host","-m","--model","--mmproj","--alias","-lcd","--slot-save-path"}
-args = sys.argv[1:]
-units = []  # (flag|None, [tokens])
-i = 0
-while i < len(args):
-    a = args[i]
-    base = a.split("=", 1)[0]
-    if base in VALFLAGS and "=" not in a and i + 1 < len(args):
-        units.append((base, [a, args[i+1]])); i += 2
-    elif base in VALFLAGS:
-        units.append((base, [a])); i += 1
-    else:
-        units.append((None, [a])); i += 1
-last = {}
-for idx, (f, _) in enumerate(units):
-    if f: last[f] = idx
-out = []
-seen_bool = set()
-for idx, (f, toks) in enumerate(units):
-    if f:
-        if last[f] == idx: out.extend(toks)
-    elif len(toks) == 1 and toks[0] in ("--embeddings", "--embedding"):
-        if "emb" not in seen_bool: out.extend(toks); seen_bool.add("emb")
-    else:
-        out.extend(toks)
-print(" ".join(out))
-PYEOF
-}
-
 run_model() {
 
     [ ! -f "$MODEL_LIST_FILE" ] && { echo "No models!"; exit 1; }
@@ -1846,8 +1832,7 @@ run_model() {
         case " $final_args " in *" --embedding"*) ;; *) final_args="$final_args --embeddings" ;; esac
         ;;
     esac
-    # user override wins, drop earlier dupes (kills '-ub specified multiple times')
-    final_args=$(dedupe_last $final_args)
+    # user override wins (llama-server last-wins)
 
     # Setup model-specific speculative decoding lookup cache
     local safe_alias=$(echo "$selected_alias" | tr -dc 'a-zA-Z0-9_-')
@@ -1927,7 +1912,7 @@ print(f'{int(block_count)}|{avg/1024/1024:.2f}|{non_block/1024/1024:.2f}')
     case $mode in
         1) select_prompt
            [ ! -x "$LLAMA_DIR/build/bin/llama-cli" ] && { echo "Error: llama-cli not compiled!"; return; }
-           run_pinned "$LLAMA_DIR/build/bin/llama-cli" -m "$selected_path" ${selected_prompt:+--system-prompt-file "$selected_prompt"} --no-display-prompt -cnv $final_args ;;
+           run_pinned "$LLAMA_DIR/build/bin/llama-cli" -m "$selected_path" ${selected_prompt:+--system-prompt-file "$selected_prompt"} --no-display-prompt $final_args ;;
         2) [ ! -x "$LLAMA_DIR/build/bin/llama-server" ] && { echo "Error: llama-server not compiled!"; return; }
            # Prepend server-mode flags now that we know the mode
            final_args="$SERVER_ARGS $final_args"
