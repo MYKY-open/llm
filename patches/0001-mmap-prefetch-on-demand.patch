@@ -1,0 +1,18 @@
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 4cb04097e..dfc19cf09 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1894,7 +1894,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     // per-tensor activation precision policy
+     prec_policy.load(ml, *this);
+ 
+-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
++    // on-demand mmap: without MAP_POPULATE the loader no longer reads the whole gguf at
++    // startup - pages are faulted in per tensor as they are used (experts on demand).
++    // LLAMA_MMAP_PREFETCH=1 restores the upstream eager populate.
++    const char * mmap_prefetch_env = getenv("LLAMA_MMAP_PREFETCH");
++    const bool mmap_prefetch = mmap_prefetch_env != NULL && atoi(mmap_prefetch_env) != 0;
++    ml.init_mappings(mmap_prefetch, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+     pimpl->mappings.reserve(ml.mappings.size());
+ 
+     // create the backend buffers
