@@ -26,6 +26,8 @@ fi
 
 # Base directories
 LLAMA_DIR="$BASE_DIR/llama.cpp-$ACTIVE_BACKEND"
+# Local patches for the llama.cpp backend: every *.patch here is applied on -i/-u and via -p
+PATCH_DIR="${PATCH_DIR:-$SCRIPT_DIR/patches}"
 modelstorage="$BASE_DIR/modelstorage"
 PROMPTS_DIR="$BASE_DIR/prompts"
 
@@ -48,30 +50,78 @@ OPENCODE_DIR="$BASE_DIR/opencode"
 CODEHAMR_DIR="$BASE_DIR/codehamr"
 
 # System Resources - dynamic, works on any core count (phone 4c .. desktop 16c)
-if command -v lscpu &> /dev/null; then
-    PHYSICAL_CORES=$(lscpu -b -p=Core,Socket 2>/dev/null | grep -v '^#' | sort -u | wc -l)
-else
-    PHYSICAL_CORES=$(nproc 2>/dev/null || echo 4)
+#
+# Physical cores + a pin list holding exactly ONE cpu per physical core.
+# Source of truth = kernel topology (thread_siblings_list), the same data the
+# scheduler uses. Handles x86 SMT (0-1 = one core), ARM without SMT (every cpu
+# is its own core) and degenerate topologies (big.LITTLE phones / some VMs where
+# every cluster reports core_id 0) that collapse lscpu (Core,Socket) pair-counting
+# down to a single "core". Sets: PHYSICAL_CORES, PHYS_PIN (ascending).
+detect_phys_cpus() {
+    local d cpu grp f first out="" seen=" "
+    for d in /sys/devices/system/cpu/cpu[0-9]*/topology/thread_siblings_list; do
+        [ -e "$d" ] || continue
+        cpu=${d#/sys/devices/system/cpu/cpu}; cpu=${cpu%%/*}
+        # skip offline cpus (cpu0 has no online file, it is always on)
+        if [ -e "/sys/devices/system/cpu/cpu$cpu/online" ] &&
+           [ "$(cat "/sys/devices/system/cpu/cpu$cpu/online" 2>/dev/null)" = 0 ]; then
+            continue
+        fi
+        grp=$(cat "$d" 2>/dev/null) || continue
+        [ -n "$grp" ] || continue
+        case "$seen" in *" $grp "*) continue ;; esac   # same sibling group = same core
+        seen="$seen$grp "
+        first=""
+        for f in ${grp//,/ }; do
+            f=${f%%-*}                                  # "0-1" -> 0
+            if [ -z "$first" ] || [ "$f" -lt "$first" ]; then first=$f; fi
+        done
+        [ -n "$first" ] && out="$out $first"
+    done
+    [ -n "$out" ] || return 1
+    PHYSICAL_CORES=$(printf '%s\n' $out | wc -l)
+    PHYS_PIN=$(printf '%s\n' $out | sort -n | paste -sd, -)
+    return 0
+}
+
+PHYSICAL_CORES=""; PHYS_PIN=""
+if ! detect_phys_cpus; then
+    # fallback 1: lscpu pair counting (sysfs topology missing/unreadable)
+    if command -v lscpu &> /dev/null; then
+        PHYSICAL_CORES=$(lscpu -b -p=Core,Socket 2>/dev/null | grep -v '^#' | sort -u | wc -l)
+        PHYS_PIN=$(lscpu -b -p=CPU,Core,Socket 2>/dev/null | grep -v '^#' | awk -F, '{if (!seen[$2","$3]++) print $1}' | sort -n | paste -sd, -)
+    fi
+fi
+if [ -z "$PHYS_PIN" ] || [ -z "$PHYSICAL_CORES" ] || [ "$PHYSICAL_CORES" -lt 1 ] 2>/dev/null; then
+    # fallback 2: no topology info at all - assume no SMT
+    PHYSICAL_CORES=$(nproc --all 2>/dev/null || echo 4)
+    PHYS_PIN=$(seq -s, 0 $((PHYSICAL_CORES - 1)))
 fi
 # sanity clamp
 [ "$PHYSICAL_CORES" -lt 2 ] 2>/dev/null && PHYSICAL_CORES=2
-BUILD_THREADS=$(nproc 2>/dev/null || echo "$PHYSICAL_CORES")  # all logical cores for compilation
-# leave 1 physical core free for system/UI. gen takes rest, batch takes half.
-GEN_THREADS=$((PHYSICAL_CORES - 1))
+
+# Build on ALL logical cpus. "nproc --all" ignores OMP_NUM_THREADS / OMP_THREAD_LIMIT;
+# bare nproc silently clamps to them (they are exported below) and halves compiles.
+BUILD_THREADS=$(nproc --all 2>/dev/null || nproc 2>/dev/null || echo "$PHYSICAL_CORES")
+BUILD_THREADS=${BUILD_THREADS:-$PHYSICAL_CORES}
+# Generation: one thread per PHYSICAL core, each pinned to its own core - no SMT
+# sibling interference, no cross-core migration. gen threads cover gen and batch.
+GEN_THREADS=$PHYSICAL_CORES
 [ "$GEN_THREADS" -lt 2 ] && GEN_THREADS=2
-BATCH_THREADS=$(((GEN_THREADS + 1) / 2))
-[ "$BATCH_THREADS" -lt 2 ] && BATCH_THREADS=2
-[ "$BATCH_THREADS" -gt "$GEN_THREADS" ] && BATCH_THREADS=$GEN_THREADS
 export BLIS_NUM_THREADS=$GEN_THREADS
 export OMP_NUM_THREADS=$GEN_THREADS
 export OMP_WAIT_POLICY=PASSIVE
 export GOMP_SPINCOUNT=0
-# PIN_CPUS: one Linux CPU per physical core, last core dropped (free for system).
-# Handles x86 SMT (0-1=same core) and ARM no-SMT (each CPU own core) both.
-PIN_CPUS=""
-if command -v lscpu &> /dev/null; then
-    PIN_CPUS=$(lscpu -b -p=CPU,Core,Socket 2>/dev/null | grep -v '^#' | awk -F, '{if (!seen[$2","$3]++) print $1}' | head -n "$GEN_THREADS" | paste -sd, -)
-fi
+# Mmap prefetch policy (needs patches/0001-mmap-prefetch-on-demand.patch in the engine).
+# 0 = do NOT MAP_POPULATE: tensors (incl. MoE experts) are faulted in on demand from
+#     disk instead of the whole gguf being read at startup - what you want on slow
+#     storage / big MoE models. First tokens after a cold start are slower.
+# 1 = upstream behavior: eager read of the entire model file at load.
+MMAP_PREFETCH="${MMAP_PREFETCH:-0}"
+export LLAMA_MMAP_PREFETCH="$MMAP_PREFETCH"
+# PIN_CPUS: generation cpus only - first GEN_THREADS entries of PHYS_PIN, i.e. one
+# cpu per physical core, SMT siblings of those cores are never used for generation.
+PIN_CPUS=$(printf '%s' "$PHYS_PIN" | tr ',' '\n' | head -n "$GEN_THREADS" | paste -sd, -)
 if [ -z "$PIN_CPUS" ]; then
     # fallback: 0..GEN-1
     PIN_CPUS=$(seq -s, 0 $((GEN_THREADS - 1)))
@@ -81,6 +131,9 @@ fi
 EDITOR=kate
 SUDO=sudo
 API_KEY="cannotguess" # placeholder default, edit me; can also come from env
+# Default llama-server port - matches upstream llama.cpp default (9931).
+# Override per-run/call: LLM_PORT=1234 llm
+DEFAULT_PORT="${LLM_PORT:-9931}"
 CMAKE_COMPILER_ARGS=()
 BUILDOPT=()
 
@@ -174,26 +227,26 @@ case "$ACTIVE_BACKEND" in
         # ikllamacpp is highly optimized for CPU inference with its own FlashMLA implementation.
         #: ikllamacpp Vulkan lacks the large-tensor fallback that mainline/beellama have;
         # output.weight is 1940 MiB which always exceeds Vulkan's 1GB buffer limit and hard-crashes.
-        DEFAULT_MODEL_ARGS="-rtr --no-warmup -fa on -ctk q8_0 -ctv q8_0 --load-mode mmap --lazy-mode on --poll 0 --poll-batch 0 --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $BATCH_THREADS -ub 1024 $LLM_DEFAULTS"
+        DEFAULT_MODEL_ARGS="-rtr --no-warmup -fa on -ctk q8_0 -ctv q8_0 --load-mode mmap --lazy-mode on --poll 0 --poll-batch 0 --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $GEN_THREADS -ub 1024 $LLM_DEFAULTS"
         ;;
     prismllamacpp)
         LLAMA_REPO="https://github.com/PrismML-Eng/llama.cpp.git"
         # PrismML fork (branch 'prism'): tracks mainline, adds PQ2_0 low-bit format
         # (~6% smaller than group-64 Q2_0) and dspark speculative decoding for Bonsai models.
         # Do NOT mix this fork's ggml-* libraries with stock llama.cpp builds.
-        DEFAULT_MODEL_ARGS="--poll 0 --poll-batch 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --load-mode mmap --lazy-mode on --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $BATCH_THREADS -ub 1024 $LLM_DEFAULTS"
+        DEFAULT_MODEL_ARGS="--poll 0 --poll-batch 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --load-mode mmap --lazy-mode on --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $GEN_THREADS -ub 1024 $LLM_DEFAULTS"
         ;;
     beellamacpp)
         LLAMA_REPO="https://github.com/Anbeeld/beellama.cpp.git"
         # beellamacpp-specific extras:
         #   --reasoning-loop-guard : auto force-closes infinite thinking loops on reasoning models
         #   -ub 2048               : beellama handles larger ubatch well, helps PP throughput
-        DEFAULT_MODEL_ARGS="--poll 0 --poll-batch 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --reasoning-loop-guard force-close --load-mode mmap --lazy-mode on --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $BATCH_THREADS -ub 2048 $LLM_DEFAULTS"
+        DEFAULT_MODEL_ARGS="--poll 0 --poll-batch 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --reasoning-loop-guard force-close --load-mode mmap --lazy-mode on --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $GEN_THREADS -ub 2048 $LLM_DEFAULTS"
         ;;
     *)
         LLAMA_REPO="https://github.com/ggerganov/llama.cpp.git"
         # Mainline llama.cpp defaults. CPU-only (no Vulkan copy = fast load), mmap+lazy, no spin.
-        DEFAULT_MODEL_ARGS="--poll 0 --poll-batch 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --load-mode mmap --lazy-mode on --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $BATCH_THREADS -ub 1024 $LLM_DEFAULTS"
+        DEFAULT_MODEL_ARGS="--poll 0 --poll-batch 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --load-mode mmap --lazy-mode on --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $GEN_THREADS -ub 1024 $LLM_DEFAULTS"
         ;;
 esac
 
@@ -201,6 +254,12 @@ esac
 # --slot-save-path only enables manual /slots/save API, no auto-save.
 # --jinja explicit on (default on anyway). --parallel 1 + sleep = low RAM + idle 0% CPU.
 SERVER_ARGS="--slot-save-path $BASE_DIR/cache --jinja --parallel 1 --sleep-idle-seconds 600"
+
+# ANSI colors for engine/patch messages (print_help has its own locals)
+C_RST=$'\033[0m'
+C_GRN=$'\033[32m'
+C_RED=$'\033[31m'
+C_YLW=$'\033[33m'
 
 # Lists / Config Directory
 CONFIG_DIR="$BASE_DIR/config"
@@ -320,7 +379,7 @@ ${c_bold}${c_cyan}Model & Prompt Management:${c_reset}
 ${c_bold}${c_cyan}Configuration & Engine Maintenance:${c_reset}
   ${c_green}-b,  --backend${c_reset}            Swap the active llama.cpp backend
   ${c_green}-vram, --vram <MB>${c_reset}        Temporarily override the MAX_VRAM_MB auto-offload limit
-  ${c_green}-p,  --patch <file>${c_reset}       Apply a .patch file to the active llama.cpp backend
+  ${c_green}-p,  --patch [file]${c_reset}       Apply a .patch (no arg = all of ./patches), then rebuild
   ${c_green}-i,  --install${c_reset}            Clone, build, and install llama.cpp & backends
   ${c_green}-u,  --upgrade${c_reset}            Upgrade all components and engines (works without a local engine)
   ${c_green}-f,  --force${c_reset}              Forcefully discard local changes during update/install
@@ -374,7 +433,7 @@ ensure_repo() {
 }
 
 run_pinned() {
-    # Dynamic pin: $PIN_CPUS = one thread per core, 1 core left free.
+    # Dynamic pin: $PIN_CPUS = one thread per physical core, SMT siblings unused.
     # exec keeps PID stable so kill $llama_pid works.
     if command -v taskset &> /dev/null && [ -n "$PIN_CPUS" ]; then
         exec taskset -c "$PIN_CPUS" "$@"
@@ -394,7 +453,7 @@ probe_remote_ctx() {
 }
 
 start_llama_server() {
-    local port=${1:-8080}
+    local port=${1:-$DEFAULT_PORT}
     echo "Starting llama-server on port $port..."
     
     if [ ! -x "$LLAMA_DIR/build/bin/llama-server" ]; then
@@ -440,8 +499,6 @@ setup_compiler() {
     export CC=gcc
     export CXX=g++
 
-    OMP_FLAG="-fopenmp"
-
     CMAKE_COMPILER_ARGS=(
         -DCMAKE_C_COMPILER=gcc
         -DCMAKE_CXX_COMPILER=g++
@@ -453,7 +510,7 @@ setup_compiler() {
         CMAKE_COMPILER_ARGS+=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache)
     fi
 
-    LLAMA_CFLAGS="$BASE_CFLAGS $OMP_FLAG"
+    LLAMA_CFLAGS="$BASE_CFLAGS"
 }
 
 install_llm_core() {
@@ -466,6 +523,7 @@ install_llm_core() {
     fi
     git pull
     git submodule update --init --recursive --depth 1
+    apply_all_patches
     setup_compiler
     run_cmake -B build "${CMAKE_COMPILER_ARGS[@]}" -DCMAKE_C_FLAGS="$LLAMA_CFLAGS" -DCMAKE_CXX_FLAGS="$LLAMA_CFLAGS" "${BUILDOPT[@]}"
     cmake --build build --config Release -j "$BUILD_THREADS"
@@ -495,6 +553,7 @@ compile_llm_core() {
     echo "Compiling llama.cpp ($ACTIVE_BACKEND)..."
     cd "$LLAMA_DIR" || exit
     git submodule update --init --recursive --depth 1
+    apply_all_patches
     setup_compiler
     run_cmake -B build "${CMAKE_COMPILER_ARGS[@]}" -DCMAKE_C_FLAGS="$LLAMA_CFLAGS" -DCMAKE_CXX_FLAGS="$LLAMA_CFLAGS" "${BUILDOPT[@]}"
     cmake --build build -j "$BUILD_THREADS"
@@ -518,6 +577,7 @@ upgrade_llm_core() {
                 git pull --rebase --autostash
             fi
             git submodule update --init --recursive --depth 1
+            apply_all_patches
             compile_llm_core
         )
     else
@@ -550,6 +610,7 @@ configure_llm() {
     ensure_repo "$LLAMA_DIR" "$LLAMA_REPO"
     cd "$LLAMA_DIR" || exit
     git submodule update --init --recursive --depth 1
+    apply_all_patches
     setup_compiler
     if [ ! -f "build/CMakeCache.txt" ]; then
         run_cmake -B build "${CMAKE_COMPILER_ARGS[@]}" -DCMAKE_C_FLAGS="$LLAMA_CFLAGS" -DCMAKE_CXX_FLAGS="$LLAMA_CFLAGS" "${BUILDOPT[@]}"
@@ -748,10 +809,10 @@ EOF
                 fi
                 # We need to re-apply it to the active backend args
                 case "$ACTIVE_BACKEND" in
-                    ikllamacpp) DEFAULT_MODEL_ARGS="-rtr --no-warmup -fa on -ctk q8_0 -ctv q8_0 --load-mode mmap --lazy-mode on --poll 0 --poll-batch 0 --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $BATCH_THREADS -ub 1024 $LLM_DEFAULTS" ;;
-                    beellamacpp) DEFAULT_MODEL_ARGS="--poll 0 --poll-batch 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --reasoning-loop-guard force-close --load-mode mmap --lazy-mode on --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $BATCH_THREADS -ub 2048 $LLM_DEFAULTS" ;;
-                    prismllamacpp) DEFAULT_MODEL_ARGS="--poll 0 --poll-batch 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --load-mode mmap --lazy-mode on --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $BATCH_THREADS -ub 1024 $LLM_DEFAULTS" ;;
-                    *) DEFAULT_MODEL_ARGS="--poll 0 --poll-batch 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --load-mode mmap --lazy-mode on --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $BATCH_THREADS -ub 1024 $LLM_DEFAULTS" ;;
+                    ikllamacpp) DEFAULT_MODEL_ARGS="-rtr --no-warmup -fa on -ctk q8_0 -ctv q8_0 --load-mode mmap --lazy-mode on --poll 0 --poll-batch 0 --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $GEN_THREADS -ub 1024 $LLM_DEFAULTS" ;;
+                    beellamacpp) DEFAULT_MODEL_ARGS="--poll 0 --poll-batch 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --reasoning-loop-guard force-close --load-mode mmap --lazy-mode on --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $GEN_THREADS -ub 2048 $LLM_DEFAULTS" ;;
+                    prismllamacpp) DEFAULT_MODEL_ARGS="--poll 0 --poll-batch 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --load-mode mmap --lazy-mode on --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $GEN_THREADS -ub 1024 $LLM_DEFAULTS" ;;
+                    *) DEFAULT_MODEL_ARGS="--poll 0 --poll-batch 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --load-mode mmap --lazy-mode on --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $GEN_THREADS -ub 1024 $LLM_DEFAULTS" ;;
                 esac
                 run_model
                 break
@@ -892,28 +953,96 @@ select_prompt() {
 # =============================================================================
 # Launchers
 # =============================================================================
+# =============================================================================
+# Patch handling
+# =============================================================================
+# One file in $PATCH_DIR = one commit to the llama.cpp tree. All of them are
+# re-applied automatically after -i / -u / -C (git pull + reset wipe them),
+# so local engine changes survive upgrades instead of silently disappearing.
+
+patch_already_applied() {
+    local pf="$1"
+    [ -d "$LLAMA_DIR/.git" ] || return 1
+    git -C "$LLAMA_DIR" apply --reverse --check "$pf" >/dev/null 2>&1
+}
+
+patch_apply_file() {
+    local pf="$1" name
+    name=$(basename "$pf")
+
+    if [ ! -f "$pf" ]; then
+        echo -e "${C_RED}[Patch]${C_RST} $name: file not found, skip"
+        return 1
+    fi
+    if patch_already_applied "$pf"; then
+        echo -e "${C_YLW}[Patch]${C_RST} $name: already applied, skip"
+        return 0
+    fi
+    # dry-run first: never half-apply or clobber patches that are already in
+    if git -C "$LLAMA_DIR" apply -3 --whitespace=nowarn --check "$pf" >/dev/null 2>&1; then
+        git -C "$LLAMA_DIR" apply -3 --whitespace=nowarn "$pf" >/dev/null 2>&1 \
+            && { echo -e "${C_GRN}[Patch]${C_RST} $name: applied (git apply)"; return 0; }
+    fi
+    if (cd "$LLAMA_DIR" && patch -p1 --forward --dry-run --silent < "$pf" >/dev/null 2>&1); then
+        (cd "$LLAMA_DIR" && patch -p1 --forward --silent < "$pf" >/dev/null 2>&1) \
+            && { echo -e "${C_GRN}[Patch]${C_RST} $name: applied (patch -p1)"; return 0; }
+    fi
+    # do not touch other local changes: only sweep rejects this attempt could make
+    find "$LLAMA_DIR" -maxdepth 5 \( -name '*.orig' -o -name '*.rej' \) -newermt '-3 minutes' -delete 2>/dev/null || true
+    echo -e "${C_RED}[Patch]${C_RST} $name: FAILED, skipped (upstream changed? fix the patch)"
+    return 1
+}
+
+apply_all_patches() {
+    [ -d "$PATCH_DIR" ] || return 0
+    local pf ok=0 bad=0
+    shopt -s nullglob
+    for pf in "$PATCH_DIR"/*.patch; do
+        if patch_apply_file "$pf"; then ok=$((ok+1)); else bad=$((bad+1)); fi
+    done
+    shopt -u nullglob
+    [ "$bad" -gt 0 ] && echo -e "${C_RED}[Patch]${C_RST} $bad patch(es) failed, continuing unpatched"
+    return 0
+}
+
 apply_patch() {
-    local patch_file="$1"
-    if [ ! -f "$patch_file" ]; then
-        echo "Error: Patch file '$patch_file' not found."
+    local patch_file="${1:-}"
+
+    if [ ! -d "$LLAMA_DIR" ]; then
+        echo -e "${C_RED}Error:${C_RST} backend dir not found: $LLAMA_DIR (run: llm -i)"
         exit 1
     fi
-    patch_file="$(realpath "$patch_file")"
-    echo "[Patch] Applying $patch_file..."
-    
-    cd "$LLAMA_DIR" || exit 1
-    if git apply -3 --whitespace=nowarn "$patch_file"; then
-        echo -e "\n${c_green}Patch applied successfully.${c_reset}"
-        echo "You can now run './llm_perf -c' to recompile the active backend."
-        exit 0
-    elif patch -p1 --forward < "$patch_file"; then
-        echo -e "\n${c_green}Patch applied successfully (via patch -p1).${c_reset}"
-        echo "You can now run './llm_perf -c' to recompile the active backend."
-        exit 0
+
+    # no arg -> apply every patch from the patches dir
+    if [ -z "$patch_file" ]; then
+        echo "[Patch] Applying all patches from $PATCH_DIR -> $LLAMA_DIR"
+        apply_all_patches
     else
-        echo -e "\n${c_red}Error: Failed to apply patch.${c_reset}"
-        exit 1
+        # accept either a path or a bare filename from PATCH_DIR
+        if [ ! -f "$patch_file" ] && [ -f "$PATCH_DIR/$(basename "$patch_file")" ]; then
+            patch_file="$PATCH_DIR/$(basename "$patch_file")"
+        fi
+        if [ ! -f "$patch_file" ]; then
+            echo -e "${C_RED}Error:${C_RST} patch file '$patch_file' not found"
+            exit 1
+        fi
+        patch_file="$(realpath "$patch_file")"
+        echo "[Patch] Applying $patch_file -> $LLAMA_DIR"
+        if ! patch_apply_file "$patch_file"; then
+            exit 1
+        fi
     fi
+
+    # recompile so the patch actually lands in the binaries
+    local ans="y"
+    if [ -t 0 ]; then
+        read -r -p "Recompile $ACTIVE_BACKEND now? [Y/n] " ans
+    fi
+    case "$ans" in
+        [nN]*) echo "Skipped. Run: llm -c" ;;
+        *)     compile_llm_core ;;
+    esac
+    exit 0
 }
 
 run_deepseek_standalone() {
@@ -923,11 +1052,11 @@ run_deepseek_standalone() {
         if [[ "$remote_host" == *:* ]]; then
             base_url="http://$remote_host/v1"
         else
-            base_url="http://$remote_host:8080/v1"
+            base_url="http://$remote_host:$DEFAULT_PORT/v1"
         fi
         echo "[DeepSeek Harness] Connecting to remote server at $base_url"
     else
-        base_url="http://localhost:8080/v1"
+        base_url="http://localhost:$DEFAULT_PORT/v1"
     fi
 
     ensure_repo "$DEEPSEEK_DIR" "$DEEPSEEK_REPO"
@@ -985,7 +1114,7 @@ run_deepseek_standalone() {
 }
 
 launch_deepseek() {
-    start_llama_server 8080
+    start_llama_server "$DEFAULT_PORT"
     run_deepseek_standalone "localhost"
     kill "$llama_pid" 2>/dev/null
 }
@@ -996,7 +1125,7 @@ run_sillytavern_standalone() {
 }
 
 launch_sillytavern() {
-    start_llama_server 8080
+    start_llama_server "$DEFAULT_PORT"
     run_sillytavern_standalone
     kill "$llama_pid" 2>/dev/null
 }
@@ -1008,11 +1137,11 @@ run_opencode_standalone() {
         if [[ "$remote_host" == *:* ]]; then
             base_url="http://$remote_host/v1"
         else
-            base_url="http://$remote_host:8080/v1"
+            base_url="http://$remote_host:$DEFAULT_PORT/v1"
         fi
         echo "[OpenCode] Connecting to remote server at $base_url"
     else
-        base_url="http://127.0.0.1:8080/v1"
+        base_url="http://127.0.0.1:$DEFAULT_PORT/v1"
     fi
 
     local OC_BIN="${HOME}/.opencode/bin/opencode"
@@ -1109,7 +1238,7 @@ run_opencode_standalone() {
 }
 
 launch_opencode() {
-    start_llama_server 8080
+    start_llama_server "$DEFAULT_PORT"
     run_opencode_standalone
     kill "$llama_pid" 2>/dev/null
 }
@@ -1121,11 +1250,11 @@ run_codehamr_standalone() {
         if [[ "$remote_host" == *:* ]]; then
             base_url="http://$remote_host"
         else
-            base_url="http://$remote_host:8080"
+            base_url="http://$remote_host:$DEFAULT_PORT"
         fi
         echo "[CodeHamr] Connecting to remote server at $base_url"
     else
-        base_url="http://localhost:8080"
+        base_url="http://localhost:$DEFAULT_PORT"
     fi
 
     local CH_BIN="$CODEHAMR_DIR/codehamr"
@@ -1157,7 +1286,7 @@ EOF
 }
 
 launch_codehamr() {
-    start_llama_server 8080
+    start_llama_server "$DEFAULT_PORT"
     run_codehamr_standalone
     kill "$llama_pid" 2>/dev/null
 }
@@ -1182,7 +1311,7 @@ run_hermes_standalone() {
         if [[ "$remote_host" == *:* ]]; then
             echo "[Hermes] Remote server: http://$remote_host/v1"
         else
-            echo "[Hermes] Remote server: http://$remote_host:8080/v1"
+            echo "[Hermes] Remote server: http://$remote_host:$DEFAULT_PORT/v1"
         fi
         echo "[Hermes] If not yet configured, run: ./llm_perf -hs"
     fi
@@ -1205,7 +1334,7 @@ run_hermes_setup() {
 }
 
 launch_hermes() {
-    start_llama_server 8080
+    start_llama_server "$DEFAULT_PORT"
     run_hermes_standalone "localhost"
     kill "$llama_pid" 2>/dev/null
 }
@@ -1234,15 +1363,15 @@ run_pi_standalone() {
     local remote_host="$1"
     local base_url
     if [ -n "$remote_host" ]; then
-        # Allow host:port or bare IP/hostname (defaults to port 8080)
+        # Allow host:port or bare IP/hostname (defaults to port 9931)
         if [[ "$remote_host" == *:* ]]; then
             base_url="http://$remote_host/v1"
         else
-            base_url="http://$remote_host:8080/v1"
+            base_url="http://$remote_host:$DEFAULT_PORT/v1"
         fi
         echo "[Pi] Connecting to remote server at $base_url"
     else
-        base_url="http://localhost:8080/v1"
+        base_url="http://localhost:$DEFAULT_PORT/v1"
     fi
     
     export MODELS_FILE="$HOME/.pi/agent/models.json"
@@ -1345,7 +1474,7 @@ run_pi_standalone() {
 }
 
 launch_pi() {
-    start_llama_server 8080
+    start_llama_server "$DEFAULT_PORT"
     run_pi_standalone
     kill "$llama_pid" 2>/dev/null
 }
@@ -1384,7 +1513,7 @@ install_mykyagent() {
 REMOTES_FILE="$CONFIG_DIR/remotes.json"
 
 remote_provider_key() {
-    # host[:port] -> stable provider key, e.g. llama-192_168_0_147 or llama-192_168_0_147-8081
+    # host[:port] -> stable provider key, e.g. llama-192_168_0_147 or llama-192_168_0_147-9931
     local h="$1"
     h="${h//./_}"
     h="${h//:/-}"
@@ -1446,13 +1575,13 @@ run_mykyagent_standalone() {
         if [[ "$remote_host" == *:* ]]; then
             base_url="http://$remote_host/v1"
         else
-            base_url="http://$remote_host:8080/v1"
+            base_url="http://$remote_host:$DEFAULT_PORT/v1"
         fi
         provider_key=$(remote_provider_key "$remote_host")
         is_remote=1
         echo "[MykyAgent] Connecting to remote server at $base_url"
     else
-        base_url="http://localhost:8080/v1"
+        base_url="http://localhost:$DEFAULT_PORT/v1"
     fi
 
     export MYKYAGENT_BASE_URL="$base_url"
@@ -1630,7 +1759,7 @@ run_mykyagent_standalone() {
 }
 
 launch_mykyagent() {
-    start_llama_server 8080
+    start_llama_server "$DEFAULT_PORT"
     run_mykyagent_standalone
     kill "$llama_pid" 2>/dev/null
 }
@@ -1663,11 +1792,11 @@ run_littlecoder_standalone() {
         if [[ "$remote_host" == *:* ]]; then
             base_url="http://$remote_host/v1"
         else
-            base_url="http://$remote_host:8080/v1"
+            base_url="http://$remote_host:$DEFAULT_PORT/v1"
         fi
         echo "[LittleCoder] Connecting to remote server at $base_url"
     else
-        base_url="http://localhost:8080/v1"
+        base_url="http://localhost:$DEFAULT_PORT/v1"
     fi
 
     export LLAMACPP_BASE_URL="$base_url"
@@ -1772,7 +1901,7 @@ run_littlecoder_standalone() {
 }
 
 launch_littlecoder() {
-    start_llama_server 8080
+    start_llama_server "$DEFAULT_PORT"
     run_littlecoder_standalone
     kill "$llama_pid" 2>/dev/null
 }
@@ -1785,7 +1914,7 @@ run_oobabooga() {
 
 
 launch_odysseus() {
-    start_llama_server 8080
+    start_llama_server "$DEFAULT_PORT"
     ensure_repo "$ODYSSEUS_DIR" "$ODYSSEUS_REPO"
     cd "$ODYSSEUS_DIR" || exit
     if [ ! -d "venv" ] && [ ! -d ".venv" ]; then
@@ -1957,7 +2086,7 @@ set -- "${NEW_ARGS[@]}"
 case "$1" in
     -is|--installscr) EXTRA_ARGS=("${@:2}"); install_script ;;
     -b|--backend)     EXTRA_ARGS=("${@:2}"); switch_backend ;;
-    -p|--patch)       EXTRA_ARGS=("${@:3}"); apply_patch "$2" ;;
+    -p|--patch)       EXTRA_ARGS=("${@:3}"); apply_patch "${2:-}" ;;
     -i|--install)     EXTRA_ARGS=("${@:2}"); install_llm_core ;;
     -u|--upgrade)     EXTRA_ARGS=("${@:2}"); upgrade_llm_core ;;
     -e|--edit)        EXTRA_ARGS=("${@:2}"); edit_script ;;
