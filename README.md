@@ -7,7 +7,7 @@ A terminal management script and orchestrator for `llama.cpp` and local AI inter
 - **Auto-NGL VRAM Calculation**: Automatically reads GGUF block structures and computes optimal GPU layer offload (`-ngl`) to fit your available VRAM.
 - **Frontend Hub**: Launch and manage multiple interfaces:
   - **CLI**: Interactive terminal (`llama-cli`)
-  - **Server**: Local or public (`0.0.0.0`) `llama-server` with API keys
+  - **Server**: Local or public (`0.0.0.0`) `llama-server` with API keys (default port **9931**, same as upstream; override with `LLM_PORT=1234 llm`)
   - **MykyAgent**: Lightweight coding agent with subagent web distillation & guardrails
   - **Pi**: Coding agent with local models
   - **Hermes**: Autonomous reasoning agent
