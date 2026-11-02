@@ -140,6 +140,21 @@ done
 # Optimized defaults with dynamic speculative decoding cache
 mkdir -p "$BASE_DIR/cache"
 
+# RAM knob defaults. --cache-ram 8192 and -ctxcp 32 are also the llama-server
+# defaults (see --help), so at those values no flag is passed at all. Idle unload
+# is this script's own policy, not an upstream default.
+# Repacking copies every repackable weight into an anonymous buffer at load. It only
+# pays off with AVX512 kernels; on AVX2 it costs the model size in RAM a second time
+# with no speedup. Builds use GGML_NATIVE, so host flags == compiled kernels.
+if grep -qw avx512f /proc/cpuinfo 2>/dev/null; then
+    RAM_DEF_NO_REPACK=0
+else
+    RAM_DEF_NO_REPACK=1
+fi
+RAM_DEF_CACHE_MIB=8192
+RAM_DEF_CTXCP=32
+RAM_DEF_IDLE_SEC=600
+
 SETTINGS_FILE="$CONFIG_DIR/llm_settings.conf"
 if [ -f "$SETTINGS_FILE" ]; then
     source "$SETTINGS_FILE"
@@ -188,11 +203,25 @@ S_SPEC_N_MIN="$S_SPEC_N_MIN"
 S_SPEC_DM="$S_SPEC_DM"
 S_CTX_SIZE="$S_CTX_SIZE"
 S_DRAFT_MODEL="$S_DRAFT_MODEL"
+RAM_NO_REPACK="$RAM_DEF_NO_REPACK"
+RAM_CACHE_MIB="$RAM_DEF_CACHE_MIB"
+RAM_CTXCP="$RAM_DEF_CTXCP"
+RAM_IDLE_SEC="$RAM_DEF_IDLE_SEC"
 EOF
 fi
 
 : "${S_XTC_PROB:=0.0}"
 : "${S_XTC_THRESH:=0.1}"
+: "${RAM_NO_REPACK:=$RAM_DEF_NO_REPACK}"
+: "${RAM_CACHE_MIB:=$RAM_DEF_CACHE_MIB}"
+: "${RAM_CTXCP:=$RAM_DEF_CTXCP}"
+: "${RAM_IDLE_SEC:=$RAM_DEF_IDLE_SEC}"
+case "$RAM_NO_REPACK" in 0|1) ;; *) RAM_NO_REPACK=$RAM_DEF_NO_REPACK ;; esac
+[[ "$RAM_CACHE_MIB" =~ ^-?[0-9]+$ ]] || RAM_CACHE_MIB=$RAM_DEF_CACHE_MIB
+[[ "$RAM_CTXCP" =~ ^[0-9]+$ ]] || RAM_CTXCP=$RAM_DEF_CTXCP
+# llama-server rejects 0 or < -1: "cannot be 0 or less than -1" (-1 = never sleep).
+[[ "$RAM_IDLE_SEC" =~ ^-?[0-9]+$ ]] && [ "$RAM_IDLE_SEC" -ge -1 ] && [ "$RAM_IDLE_SEC" != "0" ] \
+    || RAM_IDLE_SEC=$RAM_DEF_IDLE_SEC
 
 if [ "$S_MIROSTAT" != "0" ]; then
     LLM_DEFAULTS="--temp 1.0 "
@@ -245,8 +274,22 @@ esac
 
 # Server-mode extra flags (applied on top of defaults for server modes)
 # --slot-save-path only enables manual /slots/save API, no auto-save.
-# --jinja explicit on (default on anyway). --parallel 1 + sleep = low RAM + idle 0% CPU.
-SERVER_ARGS="--slot-save-path $BASE_DIR/cache --jinja --parallel 1 --sleep-idle-seconds 600"
+# --jinja explicit on (default on anyway). --parallel 1 keeps RAM flat.
+SERVER_ARGS="--slot-save-path $BASE_DIR/cache --jinja --parallel 1"
+
+# RAM knobs -> llama.cpp flags, set via `llm -s` -> Memory / RAM. No -c here on
+# purpose: context is model-specific and belongs in llm_models.txt field 3.
+# Both vars are prepended to the model/CLI args, so anything the user sets later
+# still wins (llama.cpp parses last-wins) - no duplicate-flag detection needed.
+build_ram_args() {
+    PROFILE_ARGS=""
+    PROFILE_SERVER_ARGS=""
+
+    [ "$RAM_NO_REPACK" = "1" ] && PROFILE_ARGS="-nr"
+    [ "$RAM_CACHE_MIB" != "$RAM_DEF_CACHE_MIB" ] && PROFILE_SERVER_ARGS+="--cache-ram $RAM_CACHE_MIB "
+    [ "$RAM_CTXCP" != "$RAM_DEF_CTXCP" ] && PROFILE_SERVER_ARGS+="-ctxcp $RAM_CTXCP "
+    PROFILE_SERVER_ARGS+="--sleep-idle-seconds $RAM_IDLE_SEC "
+}
 
 # ANSI colors for engine/patch messages (print_help has its own locals)
 C_RST=$'\033[0m'
@@ -458,7 +501,7 @@ start_llama_server() {
     local extra_args=()
     [ -n "$selected_alias" ] && extra_args=("--alias" "$selected_alias")
     
-    _srv_args="${extra_args[*]} $SERVER_ARGS $final_args --port $port"
+    _srv_args="${extra_args[*]} $SERVER_ARGS $PROFILE_SERVER_ARGS $final_args --port $port"
     run_pinned "$LLAMA_DIR/build/bin/llama-server" -m "$selected_path" $_srv_args > "$BASE_DIR/llama-server.log" 2>&1 &
     llama_pid=$!
     
@@ -637,6 +680,35 @@ reset_all() {
 
 edit_script() { $EDITOR "$SCRIPT_PATH"; }
 
+configure_ram_settings() {
+    local v
+    while true; do
+        local repack_state="repack"
+        [ "$RAM_NO_REPACK" = "1" ] && repack_state="no-repack"
+        local choice=$(
+            printf '%-3s %-20s %-12s %s\n' \
+                "1)" "Repack weights" "[$repack_state]" "on = AVX512 only, costs a full RAM copy; off = mmap'd, no copy" \
+                "2)" "Prompt cache MiB" "[$RAM_CACHE_MIB]" "llama-server host prompt cache (0=off, -1=unlimited)" \
+                "3)" "Context checkpoints" "[$RAM_CTXCP]" "per-slot KV checkpoint copies (0=off)" \
+                "4)" "Idle unload sec" "[$RAM_IDLE_SEC]" "server unloads the model when idle (1+ = seconds, -1 = never)" \
+                "R)" "Reset to defaults" "" "" |
+            fzf --prompt="RAM > " | awk '{print $1}' | tr -d ')'
+        )
+        [ -z "$choice" ] && return
+        case "$choice" in
+            1) [ "$RAM_NO_REPACK" = "1" ] && RAM_NO_REPACK=0 || RAM_NO_REPACK=1 ;;
+            2) read -p "Prompt cache MiB (current: $RAM_CACHE_MIB, 0=off, -1=unlimited): " v
+               [[ "$v" =~ ^-?[0-9]+$ ]] && RAM_CACHE_MIB="$v" ;;
+            3) read -p "Context checkpoints (current: $RAM_CTXCP, 0=off): " v
+               [[ "$v" =~ ^[0-9]+$ ]] && RAM_CTXCP="$v" ;;
+            4) read -p "Idle unload seconds (current: $RAM_IDLE_SEC, -1=never, 1+): " v
+               [[ "$v" =~ ^-?[0-9]+$ ]] && [ "$v" -ge -1 ] && [ "$v" != "0" ] && RAM_IDLE_SEC="$v" ;;
+            R) RAM_NO_REPACK=$RAM_DEF_NO_REPACK; RAM_CACHE_MIB=$RAM_DEF_CACHE_MIB
+               RAM_CTXCP=$RAM_DEF_CTXCP; RAM_IDLE_SEC=$RAM_DEF_IDLE_SEC ;;
+        esac
+    done
+}
+
 configure_settings() {
     while true; do
         local w_desc="\e[97m"
@@ -672,6 +744,9 @@ configure_settings() {
         printf "%-3s %-25s %-22s %b%s%b\n" "19)" "XTC Probability" "[$S_XTC_PROB]" "$w_desc" "- Exclude Top Choices prob (0.0 = off, default; 0.2 = recommended)" "$w_res"
         printf "%-3s %-25s %-22s %b%s%b\n" "20)" "XTC Threshold" "[$S_XTC_THRESH]" "$w_desc" "- Threshold for XTC triggering (only used when XTC on)" "$w_res"
         fi
+        repack_state="repack"
+        [ "$RAM_NO_REPACK" = "1" ] && repack_state="no-repack"
+        printf "%-3s %-25s %-22s %b%s%b\n" "21)" "Memory / RAM" "[$repack_state,cache:${RAM_CACHE_MIB}M,ckpt:${RAM_CTXCP},idle:${RAM_IDLE_SEC}s]" "$w_desc" "- repack, prompt cache, checkpoints, idle unload" "$w_res"
         printf "%-3s %-25s %-22s %b%s%b\n" "S)" "Save & Exit" "" "" "" ""
         printf "%-3s %-25s %-22s %b%s%b\n" "R)" "Save & Run Model" "" "" "" ""
         )
@@ -729,6 +804,7 @@ configure_settings() {
                 ;;
             19) read -p "Enter new XTC Probability (current: $S_XTC_PROB): " val; [ -n "$val" ] && S_XTC_PROB="$val" ;;
             20) read -p "Enter new XTC Threshold (current: $S_XTC_THRESH): " val; [ -n "$val" ] && S_XTC_THRESH="$val" ;;
+            21) configure_ram_settings ;;
             S) 
                 cat > "$SETTINGS_FILE" <<EOF
 S_TEMP="$S_TEMP"
@@ -752,6 +828,10 @@ S_SPEC_N_MIN="$S_SPEC_N_MIN"
 S_SPEC_DM="$S_SPEC_DM"
 S_CTX_SIZE="$S_CTX_SIZE"
 S_DRAFT_MODEL="$S_DRAFT_MODEL"
+RAM_NO_REPACK="$RAM_NO_REPACK"
+RAM_CACHE_MIB="$RAM_CACHE_MIB"
+RAM_CTXCP="$RAM_CTXCP"
+RAM_IDLE_SEC="$RAM_IDLE_SEC"
 EOF
                 echo "Settings saved to $SETTINGS_FILE"
                 break
@@ -779,6 +859,10 @@ S_SPEC_N_MIN="$S_SPEC_N_MIN"
 S_SPEC_DM="$S_SPEC_DM"
 S_CTX_SIZE="$S_CTX_SIZE"
 S_DRAFT_MODEL="$S_DRAFT_MODEL"
+RAM_NO_REPACK="$RAM_NO_REPACK"
+RAM_CACHE_MIB="$RAM_CACHE_MIB"
+RAM_CTXCP="$RAM_CTXCP"
+RAM_IDLE_SEC="$RAM_IDLE_SEC"
 EOF
                 echo "Settings saved. Launching model picker..."
                 # Rebuild LLM_DEFAULTS dynamically before running
@@ -1943,7 +2027,9 @@ run_model() {
     
     local index=$(echo "$selected" | awk '{print $1}' | tr -d ')')
     IFS='|' read -r selected_alias selected_path selected_custom <<< "$(sed "${index}q;d" "$MODEL_LIST_FILE")"
-    final_args="$DEFAULT_MODEL_ARGS $selected_custom ${EXTRA_ARGS[*]}"
+    build_ram_args
+    # precedence: defaults < RAM knobs < per-model args < explicit CLI args
+    final_args="$DEFAULT_MODEL_ARGS $PROFILE_ARGS $selected_custom ${EXTRA_ARGS[*]}"
     # embed models: server clamps ubatch to batch, so raise BOTH (else -ub 8096 -> 2048)
     # full 1120 image tokens need ub ~2300+; use 4096/4096 unless user overrode
     _lname=$(basename "$selected_path" | tr 'A-Z' 'a-z')
@@ -2041,11 +2127,11 @@ print(f'{int(block_count)}|{avg/1024/1024:.2f}|{non_block/1024/1024:.2f}')
            run_pinned "$LLAMA_DIR/build/bin/llama-cli" -m "$selected_path" ${selected_prompt:+--system-prompt-file "$selected_prompt"} --no-display-prompt $final_args ;;
         2) [ ! -x "$LLAMA_DIR/build/bin/llama-server" ] && { echo "Error: llama-server not compiled!"; return; }
            # Prepend server-mode flags now that we know the mode
-           final_args="$SERVER_ARGS $final_args"
+           final_args="$SERVER_ARGS $PROFILE_SERVER_ARGS $final_args"
            run_pinned "$LLAMA_DIR/build/bin/llama-server" -m "$selected_path" $final_args ;;
         3) [ ! -x "$LLAMA_DIR/build/bin/llama-server" ] && { echo "Error: llama-server not compiled!"; return; }
            # Prepend server-mode flags now that we know the mode
-           final_args="$SERVER_ARGS --api-key $API_KEY $final_args"
+           final_args="$SERVER_ARGS $PROFILE_SERVER_ARGS --api-key $API_KEY $final_args"
            local ips=$(ip -br addr show | awk '$1 != "lo" && $2 == "UP" {gsub(/\/[0-9]+/, "", $0); out="[" $1 "]"; for(i=3;i<=NF;i++) if($i !~ /^fe80:/) out=out " " $i; print out}' | paste -sd " | " -)
            echo "[Server] Public IPs: $ips"
            run_pinned "$LLAMA_DIR/build/bin/llama-server" -m "$selected_path" $final_args --host 0.0.0.0 ;;
