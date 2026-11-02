@@ -112,13 +112,6 @@ export BLIS_NUM_THREADS=$GEN_THREADS
 export OMP_NUM_THREADS=$GEN_THREADS
 export OMP_WAIT_POLICY=PASSIVE
 export GOMP_SPINCOUNT=0
-# Mmap prefetch policy (needs patches/0001-mmap-prefetch-on-demand.patch in the engine).
-# 0 = do NOT MAP_POPULATE: tensors (incl. MoE experts) are faulted in on demand from
-#     disk instead of the whole gguf being read at startup - what you want on slow
-#     storage / big MoE models. First tokens after a cold start are slower.
-# 1 = upstream behavior: eager read of the entire model file at load.
-MMAP_PREFETCH="${MMAP_PREFETCH:-0}"
-export LLAMA_MMAP_PREFETCH="$MMAP_PREFETCH"
 # PIN_CPUS: generation cpus only - first GEN_THREADS entries of PHYS_PIN, i.e. one
 # cpu per physical core, SMT siblings of those cores are never used for generation.
 PIN_CPUS=$(printf '%s' "$PHYS_PIN" | tr ',' '\n' | head -n "$GEN_THREADS" | paste -sd, -)
@@ -995,10 +988,10 @@ patch_apply_file() {
 
 apply_all_patches() {
     [ -d "$PATCH_DIR" ] || return 0
-    local pf ok=0 bad=0
+    local pf bad=0
     shopt -s nullglob
     for pf in "$PATCH_DIR"/*.patch; do
-        if patch_apply_file "$pf"; then ok=$((ok+1)); else bad=$((bad+1)); fi
+        patch_apply_file "$pf" || bad=$((bad+1))
     done
     shopt -u nullglob
     [ "$bad" -gt 0 ] && echo -e "${C_RED}[Patch]${C_RST} $bad patch(es) failed, continuing unpatched"
@@ -1015,6 +1008,10 @@ apply_patch() {
 
     # no arg -> apply every patch from the patches dir
     if [ -z "$patch_file" ]; then
+        if [ ! -d "$PATCH_DIR" ]; then
+            echo -e "${C_YLW}[Patch]${C_RST} $PATCH_DIR does not exist, no patches to apply"
+            return 0
+        fi
         echo "[Patch] Applying all patches from $PATCH_DIR -> $LLAMA_DIR"
         apply_all_patches
     else
