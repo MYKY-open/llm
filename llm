@@ -18,11 +18,69 @@ BASE_DIR="${MYKYSW_DIR:-$HOME/mykysw}"
 CONFIG_DIR="$BASE_DIR/config"
 mkdir -p "$CONFIG_DIR"
 ACTIVE_BACKEND_FILE="$CONFIG_DIR/active_backend.txt"
+ACTIVE_BACKEND="mainline"
 if [ -f "$ACTIVE_BACKEND_FILE" ]; then
-    ACTIVE_BACKEND=$(cat "$ACTIVE_BACKEND_FILE")
-else
-    ACTIVE_BACKEND="mainline"
+    _saved_backend=$(cat "$ACTIVE_BACKEND_FILE")
+    case "$_saved_backend" in
+        mainline|ikllamacpp) ACTIVE_BACKEND="$_saved_backend" ;;
+        "") : ;;
+        # stale config (e.g. an old backend name): fall back and self-heal the file
+        *) echo "[LLM] Unknown backend '$_saved_backend' in $ACTIVE_BACKEND_FILE - falling back to mainline." >&2
+           echo "mainline" > "$ACTIVE_BACKEND_FILE" ;;
+    esac
 fi
+
+# mainline (upstream llama.cpp + this script's defaults) vs ikllamacpp (ik_llama.cpp
+# CPU fork). Their flag sets are NOT interchangeable: ik_llama.cpp rejects
+# --load-mode/--lazy-mode/--poll/--prio/--cpu-strict*, -nr, --sleep-idle-seconds and
+# --spec-draft-n-max outright. Everything emitted below is checked against each
+# build's `llama-server --help` (see build_ram_args, build_spec_args, run_model).
+is_ik_backend() { [ "$ACTIVE_BACKEND" = "ikllamacpp" ]; }
+
+# Speculative decoding flags. Same mechanisms, different spelling:
+#   mainline: --spec-type draft-mtp --spec-draft-n-max N --spec-draft-n-min M
+#   ik      : --spec-type mtp:n_max=N,n_min=M
+# The old S_SPEC_DM knob (--spec-dm-controller) is in neither build -> dropped.
+map_spec_type_ik() {
+    case "$1" in
+        draft-simple) echo draft ;;
+        draft-mtp)    echo mtp ;;
+        draft-dflash) echo dflash ;;
+        draft-dspark) echo dspark ;;
+        draft-eagle3) echo "" ;;   # no ik_llama.cpp equivalent
+        *)            echo "$1" ;;
+    esac
+}
+
+build_spec_args() {
+    case "$S_SPEC_TYPE" in ""|none) return 0 ;; esac
+    local t="$S_SPEC_TYPE"
+    if is_ik_backend; then
+        t=$(map_spec_type_ik "$t")
+        if [ -z "$t" ]; then
+            echo "[LLM] --spec-type $S_SPEC_TYPE has no ik_llama.cpp equivalent - not passed." >&2
+            return 0
+        fi
+        if [ "$S_SPEC_N_MAX" != "0" ]; then
+            echo "--spec-type $t:n_max=$S_SPEC_N_MAX,n_min=${S_SPEC_N_MIN:-0} "
+        else
+            echo "--spec-type $t "
+        fi
+    else
+        echo "--spec-type $t "
+        [ "$S_SPEC_N_MAX" != "0" ] && echo "--spec-draft-n-max $S_SPEC_N_MAX --spec-draft-n-min $S_SPEC_N_MIN "
+    fi
+}
+
+# Per-model args (llm_models.txt field 3) and CLI args are written in mainline
+# spelling. Rewrite the spec-type names when an ik build is active. Idempotent.
+translate_spec_args_ik() {
+    is_ik_backend || { echo "$1"; return 0; }
+    sed -E 's/--spec-type draft-simple\b/--spec-type draft/g;
+            s/--spec-type draft-mtp\b/--spec-type mtp/g;
+            s/--spec-type draft-dflash\b/--spec-type dflash/g;
+            s/--spec-type draft-dspark\b/--spec-type dspark/g' <<<"$1"
+}
 
 # Base directories
 LLAMA_DIR="$BASE_DIR/llama.cpp-$ACTIVE_BACKEND"
@@ -129,6 +187,10 @@ API_KEY="cannotguess" # placeholder default, edit me; can also come from env
 DEFAULT_PORT="${LLM_PORT:-9931}"
 CMAKE_COMPILER_ARGS=()
 BUILDOPT=()
+# Opt-in GPU build: LLM_CUDA=1 llm -i / -c. Both backends compile via GGML_CUDA.
+if [ "${LLM_CUDA:-0}" = "1" ]; then
+    BUILDOPT+=(-DGGML_CUDA=ON)
+fi
 
 FORCE_RESET=0
 for arg in "$@"; do
@@ -177,7 +239,6 @@ else
     S_SPEC_TYPE="none"
     S_SPEC_N_MAX="0"
     S_SPEC_N_MIN="0"
-    S_SPEC_DM="off"
     S_CTX_SIZE="0"
     S_DRAFT_MODEL=""
     
@@ -200,7 +261,6 @@ S_PENALTY_LAST_N="$S_PENALTY_LAST_N"
 S_SPEC_TYPE="$S_SPEC_TYPE"
 S_SPEC_N_MAX="$S_SPEC_N_MAX"
 S_SPEC_N_MIN="$S_SPEC_N_MIN"
-S_SPEC_DM="$S_SPEC_DM"
 S_CTX_SIZE="$S_CTX_SIZE"
 S_DRAFT_MODEL="$S_DRAFT_MODEL"
 RAM_NO_REPACK="$RAM_DEF_NO_REPACK"
@@ -232,9 +292,8 @@ LLM_DEFAULTS+="--top-p $S_TOP_P --top-k $S_TOP_K --min-p $S_MIN_P "
 [ -n "$S_XTC_PROB" ] && [ "$S_XTC_PROB" != "0.0" ] && [ "$S_XTC_PROB" != "0" ] && LLM_DEFAULTS+="--xtc-probability $S_XTC_PROB --xtc-threshold $S_XTC_THRESH "
 LLM_DEFAULTS+="--typical $S_TYPICAL --mirostat $S_MIROSTAT --mirostat-lr $S_MIROSTAT_LR --mirostat-ent $S_MIROSTAT_ENT "
 LLM_DEFAULTS+="--presence-penalty $S_PRESENCE --frequency-penalty $S_FREQUENCY --repeat-penalty $S_PENALTY_REPEAT --repeat-last-n $S_PENALTY_LAST_N "
-[ "$S_SPEC_TYPE" != "none" ] && LLM_DEFAULTS+="--spec-type $S_SPEC_TYPE "
-[ "$S_SPEC_N_MAX" != "0" ] && LLM_DEFAULTS+="--spec-draft-n-max $S_SPEC_N_MAX --spec-draft-n-min $S_SPEC_N_MIN "
-[ "$S_SPEC_DM" != "off" ] && LLM_DEFAULTS+="--spec-dm-controller $S_SPEC_DM "
+_spec_args=$(build_spec_args)
+LLM_DEFAULTS+="$_spec_args"
 if [ "$S_CTX_SIZE" != "0" ] && [ -n "$S_CTX_SIZE" ]; then
     LLM_DEFAULTS+="-c $S_CTX_SIZE "
 fi
@@ -243,34 +302,41 @@ if [ -n "$S_DRAFT_MODEL" ] && [ "$S_DRAFT_MODEL" != '""' ]; then
 fi
 
 
-case "$ACTIVE_BACKEND" in
-    ikllamacpp)
-        LLAMA_REPO="https://github.com/ikawrakow/ik_llama.cpp.git"
-        # ikllamacpp is highly optimized for CPU inference with its own FlashMLA implementation.
-        #: ikllamacpp Vulkan lacks the large-tensor fallback that mainline/beellama have;
-        # output.weight is 1940 MiB which always exceeds Vulkan's 1GB buffer limit and hard-crashes.
-        DEFAULT_MODEL_ARGS="-rtr --no-warmup -fa on -ctk q8_0 -ctv q8_0 --load-mode mmap --lazy-mode on --poll 0 --poll-batch 0 --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $GEN_THREADS -ub 1024 $LLM_DEFAULTS"
-        ;;
-    prismllamacpp)
-        LLAMA_REPO="https://github.com/PrismML-Eng/llama.cpp.git"
-        # PrismML fork (branch 'prism'): tracks mainline, adds PQ2_0 low-bit format
-        # (~6% smaller than group-64 Q2_0) and dspark speculative decoding for Bonsai models.
-        # Do NOT mix this fork's ggml-* libraries with stock llama.cpp builds.
-        DEFAULT_MODEL_ARGS="--poll 0 --poll-batch 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --load-mode mmap --lazy-mode on --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $GEN_THREADS -ub 1024 $LLM_DEFAULTS"
-        ;;
-    beellamacpp)
-        LLAMA_REPO="https://github.com/Anbeeld/beellama.cpp.git"
-        # beellamacpp-specific extras:
-        #   --reasoning-loop-guard : auto force-closes infinite thinking loops on reasoning models
-        #   -ub 2048               : beellama handles larger ubatch well, helps PP throughput
-        DEFAULT_MODEL_ARGS="--poll 0 --poll-batch 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --reasoning-loop-guard force-close --load-mode mmap --lazy-mode on --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $GEN_THREADS -ub 2048 $LLM_DEFAULTS"
-        ;;
-    *)
-        LLAMA_REPO="https://github.com/ggerganov/llama.cpp.git"
-        # Mainline llama.cpp defaults. CPU-only (no Vulkan copy = fast load), mmap+lazy, no spin.
-        DEFAULT_MODEL_ARGS="--poll 0 --poll-batch 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --load-mode mmap --lazy-mode on --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $GEN_THREADS -ub 1024 $LLM_DEFAULTS"
-        ;;
-esac
+set_backend_defaults() {
+    case "$ACTIVE_BACKEND" in
+        ikllamacpp)
+            LLAMA_REPO="https://github.com/ikawrakow/ik_llama.cpp.git"
+            # ik_llama.cpp: CPU-specialised fork, own flag set. Do not copy mainline
+            # flags here - it aborts with "unknown argument".
+            #   -rtr   run-time repack - OFF by default here: src/llama-model-loader.cpp
+            #          allocates an owned CPU buffer and read_raw()s every tensor that has
+            #          an interleaved variant into it, so weights exist twice (mmap page
+            #          cache + anonymous copy). Measured: +0.26 GiB on LFM3-1.7B Q6_K,
+            #          +0.00 on ling Q4_K_M, and no tg gain on AVX2 (22.65 vs 22.55 t/s).
+            #          Turn it back on per machine with IK_TUNING="-rtr ...".
+            #   -mqkv  merge Q,K,V at load (no extra RSS measured)
+            #   --swa-compress  sliding-window layers get KV at window size, not n_ctx
+            #          (no-op for non-SWA models; the only cache-size knob ik adds)
+            #   -amb   attention max batch (upstream default 256). Measured here with
+            #          llama-bench on MiniCPM-35B-A3B (MoE) and LFM3-1.7B: -rtr -mqkv
+            #          was equal or better (tg +3..5%, pp +0..5%), 512 was the best
+            #          -amb of 64/128/512 and never worse than 256. Deltas are inside
+            #          CPU noise, so nothing here can regress a model - and the set is
+            #          overridable: IK_TUNING="..." in llm_settings.conf.
+            IK_TUNING="${IK_TUNING:--mqkv -amb 512 --swa-compress}"
+            # -ub 512, not 1024: on a CPU build the compute buffer scales with ubatch
+            # (measured 310 MiB @512 vs 620 MiB @1024 on ling-3.0-tiny) and the bench
+            # delta between them was inside noise, so the smaller ub is free RAM.
+            DEFAULT_MODEL_ARGS="$IK_TUNING --no-warmup -fa on -ctk q8_0 -ctv q8_0 -t $GEN_THREADS -tb $GEN_THREADS -ub 512 $LLM_DEFAULTS"
+            ;;
+        *)
+            LLAMA_REPO="https://github.com/ggerganov/llama.cpp.git"
+            # Mainline llama.cpp defaults. CPU-only (no Vulkan copy = fast load), mmap+lazy, no spin.
+            DEFAULT_MODEL_ARGS="--poll 0 --poll-batch 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --load-mode mmap --lazy-mode on --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $GEN_THREADS -ub 1024 $LLM_DEFAULTS"
+            ;;
+    esac
+}
+set_backend_defaults
 
 # Server-mode extra flags (applied on top of defaults for server modes)
 # --slot-save-path only enables manual /slots/save API, no auto-save.
@@ -285,10 +351,18 @@ build_ram_args() {
     PROFILE_ARGS=""
     PROFILE_SERVER_ARGS=""
 
-    [ "$RAM_NO_REPACK" = "1" ] && PROFILE_ARGS="-nr"
-    [ "$RAM_CACHE_MIB" != "$RAM_DEF_CACHE_MIB" ] && PROFILE_SERVER_ARGS+="--cache-ram $RAM_CACHE_MIB "
-    [ "$RAM_CTXCP" != "$RAM_DEF_CTXCP" ] && PROFILE_SERVER_ARGS+="-ctxcp $RAM_CTXCP "
-    PROFILE_SERVER_ARGS+="--sleep-idle-seconds $RAM_IDLE_SEC "
+    if is_ik_backend; then
+        # ik_llama.cpp has no -nr (it repacks at runtime via -rtr) and no
+        # --sleep-idle-seconds. It does honour --cache-ram and --ctx-checkpoints.
+        [ "$RAM_CACHE_MIB" != "$RAM_DEF_CACHE_MIB" ] && PROFILE_SERVER_ARGS+="--cache-ram $RAM_CACHE_MIB "
+        [ "$RAM_CTXCP" != "$RAM_DEF_CTXCP" ] && PROFILE_SERVER_ARGS+="--ctx-checkpoints $RAM_CTXCP "
+    else
+        [ "$RAM_NO_REPACK" = "1" ] && PROFILE_ARGS="-nr"
+        [ "$RAM_CACHE_MIB" != "$RAM_DEF_CACHE_MIB" ] && PROFILE_SERVER_ARGS+="--cache-ram $RAM_CACHE_MIB "
+        # --ctx-checkpoints is the long form of -ctxcp; both builds accept it.
+        [ "$RAM_CTXCP" != "$RAM_DEF_CTXCP" ] && PROFILE_SERVER_ARGS+="--ctx-checkpoints $RAM_CTXCP "
+        PROFILE_SERVER_ARGS+="--sleep-idle-seconds $RAM_IDLE_SEC "
+    fi
 }
 
 # ANSI colors for engine/patch messages (print_help has its own locals)
@@ -310,7 +384,6 @@ PROMPT_LIST_FILE="$CONFIG_DIR/llm_prompts.txt"
 export FZF_DEFAULT_OPTS="--color=dark,bg+:-1,fg:gray,fg+:white,prompt:blue,pointer:red,marker:yellow"
 
 # Auto-Offload VRAM Limit (in Megabytes). Set to 0 to disable.
-MAX_VRAM_MB="0"
 
 # Base compiler flags (-O3 already comes from CMAKE_BUILD_TYPE=Release)
 # -fno-plt             : skip PLT trampolines (faster shared-lib calls)
@@ -331,6 +404,21 @@ run_cmake() {
         rm -rf build/CMakeCache.txt build/CMakeFiles
         cmake "$@"
     fi
+}
+
+# Bytes -> human string. awk keeps this portable (numfmt is not everywhere).
+human_size() {
+    awk -v b="${1:-0}" 'BEGIN {
+        if (b < 1024)            printf "%d B", b
+        else if (b < 1048576)    printf "%.0f KB", b / 1024
+        else if (b < 1073741824) printf "%.0f MB", b / 1048576
+        else                     printf "%.2f GB", b / 1073741824
+    }'
+}
+
+# Apparent size of a single file in bytes; 0 when it is missing.
+file_size() {
+    stat -c %s -- "$1" 2>/dev/null || echo 0
 }
 
 fzf_with_usage() {
@@ -406,7 +494,7 @@ ${c_bold}${c_cyan}Standalone UIs & Agents:${c_reset}
 ${c_bold}${c_cyan}Model & Prompt Management:${c_reset}
   ${c_green}-s,  --settings${c_reset}           Launch interactive sampling settings menu
   ${c_green}-sm, --scan-models${c_reset}        Scan for models in the current directory
-  ${c_green}-d,  --delete${c_reset}             Delete a model entry from the saved list
+  ${c_green}-d,  --delete${c_reset}             Delete a model, showing disk usage per model + total
   ${c_green}-m,  --modellistedit${c_reset}      Manually edit the model list file
   ${c_green}-ps, --scan-prompts${c_reset}       Scan for .txt prompt files
   ${c_green}-pd, --delete-prompt${c_reset}      Delete a saved prompt entry
@@ -414,7 +502,6 @@ ${c_bold}${c_cyan}Model & Prompt Management:${c_reset}
 
 ${c_bold}${c_cyan}Configuration & Engine Maintenance:${c_reset}
   ${c_green}-b,  --backend${c_reset}            Swap the active llama.cpp backend
-  ${c_green}-vram, --vram <MB>${c_reset}        Temporarily override the MAX_VRAM_MB auto-offload limit
   ${c_green}-p,  --patch [file]${c_reset}       Apply a .patch (no arg = all of ./patches), then rebuild
   ${c_green}-i,  --install${c_reset}            Clone, build, and install llama.cpp & backends
   ${c_green}-u,  --upgrade${c_reset}            Upgrade all components and engines (works without a local engine)
@@ -431,7 +518,6 @@ ${c_bold}${c_cyan}Script Options:${c_reset}
 
 ${c_bold}${c_cyan}Examples:${c_reset}
   llm ${c_green}-he 192.168.1.100${c_reset}     Launch Hermes connected to a remote remote server
-  llm ${c_green}-vram 8192${c_reset}            Launch interactive menu, capping VRAM at 8GB
   llm                       Launch the interactive model picker menu
 "
 }
@@ -505,19 +591,31 @@ start_llama_server() {
     run_pinned "$LLAMA_DIR/build/bin/llama-server" -m "$selected_path" $_srv_args > "$BASE_DIR/llama-server.log" 2>&1 &
     llama_pid=$!
     
-    echo -n "Waiting for server to be ready..."
-    for i in {1..60}; do
-        if curl -s "http://localhost:$port/health" | grep -q '{"status":"ok"}'; then
+    # Readiness: match the field, not the whole object - ik_llama.cpp answers
+    # {"status":"ok","slots_idle":N,"slots_processing":N} while mainline answers
+    # {"status":"ok"}, so the old literal object match never fired on ik builds.
+    local wait_s="${LLM_READY_TIMEOUT:-180}" ready=0
+    echo -n "Waiting for server to be ready (up to ${wait_s}s)..."
+    for ((i = 0; i < wait_s; i++)); do
+        if curl -s -m 2 "http://127.0.0.1:$port/health" | grep -q '"status":"ok"'; then
             echo " Ready!"
+            ready=1
             break
         fi
         if ! kill -0 "$llama_pid" 2>/dev/null; then
-            echo -e "\nServer crashed! Check $BASE_DIR/llama-server.log"
+            echo -e "\nServer crashed! Last lines of $BASE_DIR/llama-server.log:"
+            tail -n 15 "$BASE_DIR/llama-server.log" 2>/dev/null
             exit 1
         fi
         echo -n "."
         sleep 1
     done
+    if [ "$ready" = "0" ]; then
+        echo -e "\nServer not ready after ${wait_s}s (set LLM_READY_TIMEOUT to wait longer)."
+        echo "Last lines of $BASE_DIR/llama-server.log:"
+        tail -n 15 "$BASE_DIR/llama-server.log" 2>/dev/null
+        exit 1
+    fi
     
     # Export common AI environment variables for downstream clients
     export OPENAI_API_BASE_URL="http://localhost:$port/v1"
@@ -655,11 +753,11 @@ configure_llm() {
 }
 
 switch_backend() {
-    local backend_menu="1) mainline (fastest model support, universal, slowest)\n2) ikllamacpp (slowest model support, fastest for cuda only)\n3) beellamacpp (good model support, universal, fast)\n4) prismllamacpp (PrismML fork: PQ2_0 low-bit + dspark spec decoding, Bonsai models)"
+    local backend_menu="1) mainline (fastest model support, universal, slowest)\n2) ikllamacpp (slowest model support, fastest for cuda only)"
     local selected=$(echo -e "$backend_menu" | fzf_with_usage backends --prompt="Select Backend > " | awk '{print $2}')
     [ -z "$selected" ] && return
     
-    if [[ "$selected" =~ ^(mainline|ikllamacpp|beellamacpp|prismllamacpp)$ ]]; then
+    if [[ "$selected" =~ ^(mainline|ikllamacpp)$ ]]; then
         echo "$selected" > "$ACTIVE_BACKEND_FILE"
         echo "Active backend set to: $selected"
     else
@@ -737,16 +835,15 @@ configure_settings() {
         printf "%-3s %-25s %-22s %b%s%b\n" "13)" "Speculative Type" "[$S_SPEC_TYPE]" "$w_desc" "- Mechanism to guess future tokens (ngram, eagle)" "$w_res"
         printf "%-3s %-25s %-22s %b%s%b\n" "14)" "Speculative Draft Max" "[$S_SPEC_N_MAX]" "$w_desc" "- Maximum tokens to guess per step" "$w_res"
         printf "%-3s %-25s %-22s %b%s%b\n" "15)" "Speculative Draft Min" "[$S_SPEC_N_MIN]" "$w_desc" "- Minimum tokens to guess per step" "$w_res"
-        printf "%-3s %-25s %-22s %b%s%b\n" "16)" "Speculative DM Control" "[$S_SPEC_DM]" "$w_desc" "- Adaptive control (e.g. 'profit') to optimize speed" "$w_res"
-        printf "%-3s %-25s %-22s %b%s%b\n" "17)" "Context Size (0=auto)" "[$S_CTX_SIZE]" "$w_desc" "- Maximum number of tokens the model can remember" "$w_res"
-        printf "%-3s %-25s %-22s %b%s%b\n" "18)" "Draft Model Path" "[$S_DRAFT_MODEL]" "$w_desc" "- External draft model file for speculation" "$w_res"
+        printf "%-3s %-25s %-22s %b%s%b\n" "16)" "Context Size (0=auto)" "[$S_CTX_SIZE]" "$w_desc" "- Maximum number of tokens the model can remember" "$w_res"
+        printf "%-3s %-25s %-22s %b%s%b\n" "17)" "Draft Model Path" "[$S_DRAFT_MODEL]" "$w_desc" "- External draft model file for speculation" "$w_res"
         if [ "$S_MIROSTAT" == "0" ]; then
-        printf "%-3s %-25s %-22s %b%s%b\n" "19)" "XTC Probability" "[$S_XTC_PROB]" "$w_desc" "- Exclude Top Choices prob (0.0 = off, default; 0.2 = recommended)" "$w_res"
-        printf "%-3s %-25s %-22s %b%s%b\n" "20)" "XTC Threshold" "[$S_XTC_THRESH]" "$w_desc" "- Threshold for XTC triggering (only used when XTC on)" "$w_res"
+        printf "%-3s %-25s %-22s %b%s%b\n" "18)" "XTC Probability" "[$S_XTC_PROB]" "$w_desc" "- Exclude Top Choices prob (0.0 = off, default; 0.2 = recommended)" "$w_res"
+        printf "%-3s %-25s %-22s %b%s%b\n" "19)" "XTC Threshold" "[$S_XTC_THRESH]" "$w_desc" "- Threshold for XTC triggering (only used when XTC on)" "$w_res"
         fi
         repack_state="repack"
         [ "$RAM_NO_REPACK" = "1" ] && repack_state="no-repack"
-        printf "%-3s %-25s %-22s %b%s%b\n" "21)" "Memory / RAM" "[$repack_state,cache:${RAM_CACHE_MIB}M,ckpt:${RAM_CTXCP},idle:${RAM_IDLE_SEC}s]" "$w_desc" "- repack, prompt cache, checkpoints, idle unload" "$w_res"
+        printf "%-3s %-25s %-22s %b%s%b\n" "20)" "Memory / RAM" "[$repack_state,cache:${RAM_CACHE_MIB}M,ckpt:${RAM_CTXCP},idle:${RAM_IDLE_SEC}s]" "$w_desc" "- repack, prompt cache, checkpoints, idle unload" "$w_res"
         printf "%-3s %-25s %-22s %b%s%b\n" "S)" "Save & Exit" "" "" "" ""
         printf "%-3s %-25s %-22s %b%s%b\n" "R)" "Save & Run Model" "" "" "" ""
         )
@@ -776,12 +873,8 @@ configure_settings() {
                 ;;
             14) read -p "Enter new Speculative Draft Max (current: $S_SPEC_N_MAX): " val; [ -n "$val" ] && S_SPEC_N_MAX="$val" ;;
             15) read -p "Enter new Speculative Draft Min (current: $S_SPEC_N_MIN): " val; [ -n "$val" ] && S_SPEC_N_MIN="$val" ;;
-            16) 
-                local val=$(echo -e "off\nprofit" | fzf --prompt="DM Controller > ")
-                [ -n "$val" ] && S_SPEC_DM="$val"
-                ;;
-            17) read -p "Enter new Context Size (current: $S_CTX_SIZE): " val; [ -n "$val" ] && S_CTX_SIZE="$val" ;;
-            18) 
+            16) read -p "Enter new Context Size (current: $S_CTX_SIZE): " val; [ -n "$val" ] && S_CTX_SIZE="$val" ;;
+            17) 
                 local dm_src=$(echo -e "From Model List\nEnter Path\nDisable" | fzf --prompt="Draft Model Source > ")
                 if [ "$dm_src" == "From Model List" ]; then
                     if [ ! -f "$MODEL_LIST_FILE" ]; then
@@ -802,9 +895,9 @@ configure_settings() {
                     S_DRAFT_MODEL=""
                 fi
                 ;;
-            19) read -p "Enter new XTC Probability (current: $S_XTC_PROB): " val; [ -n "$val" ] && S_XTC_PROB="$val" ;;
-            20) read -p "Enter new XTC Threshold (current: $S_XTC_THRESH): " val; [ -n "$val" ] && S_XTC_THRESH="$val" ;;
-            21) configure_ram_settings ;;
+            18) read -p "Enter new XTC Probability (current: $S_XTC_PROB): " val; [ -n "$val" ] && S_XTC_PROB="$val" ;;
+            19) read -p "Enter new XTC Threshold (current: $S_XTC_THRESH): " val; [ -n "$val" ] && S_XTC_THRESH="$val" ;;
+            20) configure_ram_settings ;;
             S) 
                 cat > "$SETTINGS_FILE" <<EOF
 S_TEMP="$S_TEMP"
@@ -825,7 +918,6 @@ S_PENALTY_LAST_N="$S_PENALTY_LAST_N"
 S_SPEC_TYPE="$S_SPEC_TYPE"
 S_SPEC_N_MAX="$S_SPEC_N_MAX"
 S_SPEC_N_MIN="$S_SPEC_N_MIN"
-S_SPEC_DM="$S_SPEC_DM"
 S_CTX_SIZE="$S_CTX_SIZE"
 S_DRAFT_MODEL="$S_DRAFT_MODEL"
 RAM_NO_REPACK="$RAM_NO_REPACK"
@@ -856,7 +948,6 @@ S_PENALTY_LAST_N="$S_PENALTY_LAST_N"
 S_SPEC_TYPE="$S_SPEC_TYPE"
 S_SPEC_N_MAX="$S_SPEC_N_MAX"
 S_SPEC_N_MIN="$S_SPEC_N_MIN"
-S_SPEC_DM="$S_SPEC_DM"
 S_CTX_SIZE="$S_CTX_SIZE"
 S_DRAFT_MODEL="$S_DRAFT_MODEL"
 RAM_NO_REPACK="$RAM_NO_REPACK"
@@ -875,22 +966,15 @@ EOF
                 [ -n "$S_XTC_PROB" ] && [ "$S_XTC_PROB" != "0.0" ] && [ "$S_XTC_PROB" != "0" ] && LLM_DEFAULTS+="--xtc-probability $S_XTC_PROB --xtc-threshold $S_XTC_THRESH "
                 LLM_DEFAULTS+="--typical $S_TYPICAL --mirostat $S_MIROSTAT --mirostat-lr $S_MIROSTAT_LR --mirostat-ent $S_MIROSTAT_ENT "
                 LLM_DEFAULTS+="--presence-penalty $S_PRESENCE --frequency-penalty $S_FREQUENCY --repeat-penalty $S_PENALTY_REPEAT --repeat-last-n $S_PENALTY_LAST_N "
-                [ "$S_SPEC_TYPE" != "none" ] && LLM_DEFAULTS+="--spec-type $S_SPEC_TYPE "
-                [ "$S_SPEC_N_MAX" != "0" ] && LLM_DEFAULTS+="--spec-draft-n-max $S_SPEC_N_MAX --spec-draft-n-min $S_SPEC_N_MIN "
-                [ "$S_SPEC_DM" != "off" ] && LLM_DEFAULTS+="--spec-dm-controller $S_SPEC_DM "
+                [ "$S_SPEC_TYPE" != "none" ] && LLM_DEFAULTS+="$(build_spec_args)"
                 if [ "$S_CTX_SIZE" != "0" ] && [ -n "$S_CTX_SIZE" ]; then
                     LLM_DEFAULTS+="-c $S_CTX_SIZE "
                 fi
                 if [ -n "$S_DRAFT_MODEL" ] && [ "$S_DRAFT_MODEL" != '""' ]; then
                     LLM_DEFAULTS+="-md $S_DRAFT_MODEL "
                 fi
-                # We need to re-apply it to the active backend args
-                case "$ACTIVE_BACKEND" in
-                    ikllamacpp) DEFAULT_MODEL_ARGS="-rtr --no-warmup -fa on -ctk q8_0 -ctv q8_0 --load-mode mmap --lazy-mode on --poll 0 --poll-batch 0 --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $GEN_THREADS -ub 1024 $LLM_DEFAULTS" ;;
-                    beellamacpp) DEFAULT_MODEL_ARGS="--poll 0 --poll-batch 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --reasoning-loop-guard force-close --load-mode mmap --lazy-mode on --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $GEN_THREADS -ub 2048 $LLM_DEFAULTS" ;;
-                    prismllamacpp) DEFAULT_MODEL_ARGS="--poll 0 --poll-batch 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --load-mode mmap --lazy-mode on --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $GEN_THREADS -ub 1024 $LLM_DEFAULTS" ;;
-                    *) DEFAULT_MODEL_ARGS="--poll 0 --poll-batch 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --load-mode mmap --lazy-mode on --cpu-strict 1 --cpu-strict-batch 1 --prio -1 -t $GEN_THREADS -tb $GEN_THREADS -ub 1024 $LLM_DEFAULTS" ;;
-                esac
+                # re-apply the backend args (LLM_DEFAULTS just changed)
+                set_backend_defaults
                 run_model
                 break
                 ;;
@@ -993,15 +1077,58 @@ scan_prompts() {
 }
 
 delete_model() {
-    [ ! -f "$MODEL_LIST_FILE" ] && exit 1
-    local selected=$(cat "$MODEL_LIST_FILE" | awk -F'|' '{printf "%2d) %-20s %s [%s]\n", NR, $1, $2, $3}' | fzf --prompt="Select model to delete > ")
-    [ -z "$selected" ] && return
-    
-    local index=$(echo "$selected" | awk '{print $1}' | tr -d ')')
-    IFS='|' read -r alias mpath _ <<< "$(sed "${index}q;d" "$MODEL_LIST_FILE")"
-    read -rp "Delete file $mpath? [y/N] " confirm
-    [[ "$confirm" =~ ^[Yy]$ ]] && rm -f "$mpath"
-    sed -i "${index}d" "$MODEL_LIST_FILE"
+    [ ! -f "$MODEL_LIST_FILE" ] && { echo "No models saved in $MODEL_LIST_FILE"; exit 1; }
+
+    # One pass over the list: per-model size, running total. Then a second pass
+    # over model storage for .gguf files the list has forgotten - they still eat
+    # the disk, but cannot be picked (no index to delete).
+    local rows="" total=0 n=0 untracked=0
+    local alias mpath margs psize
+    local tracked_tmp; tracked_tmp=$(mktemp)
+    while IFS='|' read -r alias mpath margs; do
+        [ -z "$alias" ] && continue
+        printf '%s\n' "$mpath" >> "$tracked_tmp"
+        psize=$(file_size "$mpath")
+        total=$((total + psize))
+        n=$((n + 1))
+        rows+="$(printf '%2d) %9s  %-22s %s\n' "$n" "$(human_size "$psize")" "$alias" "$mpath")"$'\n'
+    done < "$MODEL_LIST_FILE"
+
+    shopt -s nullglob
+    local f
+    for f in "$modelstorage"/*.gguf; do
+        grep -Fqx -- "$f" "$tracked_tmp" && continue
+        psize=$(file_size "$f")
+        untracked=$((untracked + psize))
+        rows+="$(printf '%2s) %9s  %-22s %s\n' "-" "$(human_size "$psize")" "${f##*/}" "$f")"$'\n'
+    done
+    rm -f "$tracked_tmp"
+
+    echo "Model storage: $modelstorage"
+    printf '%s' "$rows"
+    printf '\n  total: %s in %d model(s)' "$(human_size "$total")" "$n"
+    [ "$untracked" -gt 0 ] && printf ' + %s untracked' "$(human_size "$untracked")"
+    printf '\n'
+
+    # No terminal: the report is the whole output.
+    [ -t 0 ] || return 0
+
+    local header="total $(human_size "$total") in $n model(s)"
+    local selected
+    selected=$(printf '%s' "$rows" | fzf --prompt="Select model to delete > " --header "$header") || return 0
+    [ -z "$selected" ] && return 0
+
+    local index; index=$(echo "$selected" | awk '{print $1}' | tr -d ')')
+    [[ "$index" =~ ^[0-9]+$ ]] || { echo "Not in $MODEL_LIST_FILE - delete the file by hand."; return; }
+    IFS='|' read -r alias mpath margs <<< "$(sed "${index}q;d" "$MODEL_LIST_FILE")"
+
+    local freed; freed=$(file_size "$mpath")
+    [ -f "$mpath" ] || echo "Warning: $mpath is already gone."
+    read -rp "Delete $mpath ($(human_size "$freed"))? [y/N] " confirm
+    if [[ "${confirm:-N}" =~ ^[Yy]$ ]]; then
+        rm -f -- "$mpath" && echo "Freed $(human_size "$freed")"
+        sed -i "${index}d" "$MODEL_LIST_FILE"
+    fi
 }
 
 delete_prompt() {
@@ -1568,7 +1695,7 @@ install_mykyagent() {
     fi
 
     if ! command -v uv &> /dev/null; then
-        echo -e "\033[33m[Warning] 'uv' is not installed. Web search/fetch tools and GGUF Auto-NGL require uv.\033[0m"
+        echo -e "\033[33m[Warning] 'uv' is not installed. Web search/fetch tools and GGUF probing require uv.\033[0m"
         echo "          Install via: curl -LsSf https://astral.sh/uv/install.sh | sh"
     fi
 
@@ -2019,6 +2146,7 @@ run_odysseus_standalone() {
 }
 
 
+
 run_model() {
 
     [ ! -f "$MODEL_LIST_FILE" ] && { echo "No models!"; exit 1; }
@@ -2030,6 +2158,8 @@ run_model() {
     build_ram_args
     # precedence: defaults < RAM knobs < per-model args < explicit CLI args
     final_args="$DEFAULT_MODEL_ARGS $PROFILE_ARGS $selected_custom ${EXTRA_ARGS[*]}"
+    # per-model + CLI args are written in mainline spelling; ik needs its own names
+    final_args=$(translate_spec_args_ik "$final_args")
     # embed models: server clamps ubatch to batch, so raise BOTH (else -ub 8096 -> 2048)
     # full 1120 image tokens need ub ~2300+; use 4096/4096 unless user overrode
     _lname=$(basename "$selected_path" | tr 'A-Z' 'a-z')
@@ -2052,70 +2182,6 @@ run_model() {
     touch "$model_cache"
     SERVER_ARGS="$SERVER_ARGS -lcd $model_cache"
 
-    if [ "$MAX_VRAM_MB" -gt 0 ] && [ -f "$selected_path" ]; then
-        echo -e "\n[Auto-NGL] Calculating optimal VRAM offload..."
-        
-        local NGL_CACHE_FILE="$CONFIG_DIR/ngl_cache.txt"
-        [ ! -f "$NGL_CACHE_FILE" ] && touch "$NGL_CACHE_FILE"
-        
-        # Cache format: path|layers|avg_block_mb|non_block_mb
-        local cache_hit=$(awk -F'|' -v path="$selected_path" '$1 == path {print $2"|"$3"|"$4; exit}' "$NGL_CACHE_FILE")
-        local layers avg_block_mb non_block_mb
-
-        if [ -n "$cache_hit" ]; then
-            echo "[Auto-NGL] Fast-loaded layer sizes from cache!"
-            IFS='|' read -r layers avg_block_mb non_block_mb <<< "$cache_hit"
-        else
-            if ! command -v uv &>/dev/null; then
-                echo "[Auto-NGL] Notice: 'uv' is not installed; cannot probe GGUF architecture automatically."
-            fi
-            local gguf_out
-            gguf_out=$(uv run -q --with gguf python -c "
-import gguf, re
-r = gguf.GGUFReader('$selected_path')
-block_count = next(v for k,v in r.fields.items() if 'block_count' in k).parts[-1].tolist()[0]
-non_block = 0
-blocks = {}
-for t in r.tensors:
-    m = re.match(r'blk\.(\d+)\.', t.name)
-    if m:
-        l = int(m.group(1))
-        blocks[l] = blocks.get(l, 0) + t.n_bytes
-    else:
-        non_block += t.n_bytes
-avg = sum(blocks.values()) / len(blocks) if blocks else 0
-print(f'{int(block_count)}|{avg/1024/1024:.2f}|{non_block/1024/1024:.2f}')
-" 2>/dev/null)
-            if [ -n "$gguf_out" ]; then
-                IFS='|' read -r layers avg_block_mb non_block_mb <<< "$gguf_out"
-                sed -i "\|^$selected_path|d" "$NGL_CACHE_FILE" 2>/dev/null || true
-                echo "$selected_path|$layers|$avg_block_mb|$non_block_mb" >> "$NGL_CACHE_FILE"
-            fi
-        fi
-
-        if [ -n "$layers" ] && [ "$layers" -gt 0 ]; then
-            # Reserve ~512 MB for KV cache and compute scratch buffers
-            local compute_reserve_mb=512
-            local avg_block_int=$(echo "$avg_block_mb" | cut -d. -f1)
-            local non_block_int=$(echo "$non_block_mb" | cut -d. -f1)
-
-            local available_vram=$((MAX_VRAM_MB - non_block_int - compute_reserve_mb))
-            [ "$available_vram" -lt 0 ] && available_vram=0
-
-            if [ "$avg_block_int" -gt 0 ]; then
-                local calculated_ngl=$((available_vram / avg_block_int))
-                [ "$calculated_ngl" -gt "$layers" ] && calculated_ngl=$layers
-                echo "[Auto-NGL] Model: ${layers} layers, ~${avg_block_mb}MB/layer, ${non_block_mb}MB overhead"
-                echo "[Auto-NGL] Budget: ${MAX_VRAM_MB}MB VRAM - ${non_block_int}MB overhead - ${compute_reserve_mb}MB reserve = ${available_vram}MB for layers"
-                echo "[Auto-NGL] Setting -ngl to $calculated_ngl"
-
-                final_args=$(echo "$final_args" | sed -E 's/-ngl [0-9]+//g')
-                final_args="-ngl $calculated_ngl $final_args"
-            fi
-        else
-            echo "[Auto-NGL] Failed to read layer count from GGUF. Falling back to default."
-        fi
-    fi
 
     local mode_menu="1) CLI\n2) Server\n3) Public\n4) Silly\n5) OpenCode\n6) Odysseus\n7) Codehamr\n8) Hermes\n9) Pi\n10) Little-coder\n11) Deepseek-harness\n12) MykyAgent"
     local mode=$(echo -e "$mode_menu" | fzf_with_usage modes --prompt="Mode > " | awk '{print $1}' | tr -d ')')
@@ -2128,13 +2194,13 @@ print(f'{int(block_count)}|{avg/1024/1024:.2f}|{non_block/1024/1024:.2f}')
         2) [ ! -x "$LLAMA_DIR/build/bin/llama-server" ] && { echo "Error: llama-server not compiled!"; return; }
            # Prepend server-mode flags now that we know the mode
            final_args="$SERVER_ARGS $PROFILE_SERVER_ARGS $final_args"
-           run_pinned "$LLAMA_DIR/build/bin/llama-server" -m "$selected_path" $final_args ;;
+           run_pinned "$LLAMA_DIR/build/bin/llama-server" -m "$selected_path" $final_args --port "$DEFAULT_PORT" ;;
         3) [ ! -x "$LLAMA_DIR/build/bin/llama-server" ] && { echo "Error: llama-server not compiled!"; return; }
            # Prepend server-mode flags now that we know the mode
            final_args="$SERVER_ARGS $PROFILE_SERVER_ARGS --api-key $API_KEY $final_args"
            local ips=$(ip -br addr show | awk '$1 != "lo" && $2 == "UP" {gsub(/\/[0-9]+/, "", $0); out="[" $1 "]"; for(i=3;i<=NF;i++) if($i !~ /^fe80:/) out=out " " $i; print out}' | paste -sd " | " -)
            echo "[Server] Public IPs: $ips"
-           run_pinned "$LLAMA_DIR/build/bin/llama-server" -m "$selected_path" $final_args --host 0.0.0.0 ;;
+           run_pinned "$LLAMA_DIR/build/bin/llama-server" -m "$selected_path" $final_args --host 0.0.0.0 --port "$DEFAULT_PORT" ;;
         4) launch_sillytavern ;;
         5) launch_opencode ;;
         6) launch_odysseus ;;
@@ -2151,19 +2217,6 @@ print(f'{int(block_count)}|{avg/1024/1024:.2f}|{non_block/1024/1024:.2f}')
 # =============================================================================
 # Main Entry Point
 # =============================================================================
-
-# Extract -vram if present so we can override MAX_VRAM_MB dynamically
-NEW_ARGS=()
-while [[ $# -gt 0 ]]; do
-    if [[ "$1" == "-vram" || "$1" == "--vram" ]]; then
-        MAX_VRAM_MB="$2"
-        shift 2
-    else
-        NEW_ARGS+=("$1")
-        shift
-    fi
-done
-set -- "${NEW_ARGS[@]}"
 
 # Set EXTRA_ARGS depending on whether the first argument was a script flag
 case "$1" in
