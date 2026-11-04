@@ -187,10 +187,6 @@ API_KEY="cannotguess" # placeholder default, edit me; can also come from env
 DEFAULT_PORT="${LLM_PORT:-9931}"
 CMAKE_COMPILER_ARGS=()
 BUILDOPT=()
-# Opt-in GPU build: LLM_CUDA=1 llm -i / -c. Both backends compile via GGML_CUDA.
-if [ "${LLM_CUDA:-0}" = "1" ]; then
-    BUILDOPT+=(-DGGML_CUDA=ON)
-fi
 
 FORCE_RESET=0
 for arg in "$@"; do

@@ -38,7 +38,7 @@ in `llm_models.txt` field 3 (per model), `IK_TUNING`, or on the CLI:
 - **ikllamacpp**: `--fit --fit-margin <MiB>` (per-tensor placement), `-ncmoe N` (first N layers' MoE experts stay on CPU), `-dexp` (defer expert mmap), `-nkvo` (KV in RAM), `-ot name=buf`, `-gfm layer,margin`.
 - **Cache**: `--swa-compress` is in the ik default tuning (sliding-window layers get KV at window size, not `n_ctx`).
 
-`LLM_CUDA=1 llm -i` (or `-c`) builds with `-DGGML_CUDA=ON`; plain builds stay CPU-only.
+Build options (CUDA/Vulkan/SYCL, static vs shared, etc.) are not hardcoded: `llm -C` opens ccmake on the build dir, then rebuild with `llm -c` (or wipe first with `llm -Re`).
 
 ## Usage
 
