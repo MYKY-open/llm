@@ -381,12 +381,27 @@ export FZF_DEFAULT_OPTS="--color=dark,bg+:-1,fg:gray,fg+:white,prompt:blue,point
 
 # Auto-Offload VRAM Limit (in Megabytes). Set to 0 to disable.
 
-# Base compiler flags (-O3 already comes from CMAKE_BUILD_TYPE=Release)
-# -fno-plt             : skip PLT trampolines (faster shared-lib calls)
-# -fipa-pta            : inter-procedural points-to analysis (GCC-only)
-# -fno-stack-protector : drop stack canary overhead (inference server, no user input)
-# -funroll-loops       : unroll hot loops (helps GGML kernels)
-BASE_CFLAGS="-fno-plt -fipa-pta -fno-stack-protector -funroll-loops"
+# Extra compiler flags. -O3 comes from CMAKE_BUILD_TYPE=Release.
+# GGML_NATIVE=ON gives ggml/* -march=native, but llama/* and common/* were built
+# for generic x86 - these two flags fix exactly that, nothing else. Measured on
+# MiniCPM-35B-A3B (llama-bench, paired A/B, plain Release baseline, same tree):
+#   pp  +0.96 % (95 % CI +0.47..+1.44) and +1.22 % (CI +0.54..+1.90), two runs
+#   tg  +0.84 / +0.87 %  (CI -0.10..+1.85 / -0.01..+1.69, borderline)
+#   end-to-end llama-cli with the real sampler: +2.0 % (CI -1.8..+5.9)
+# -march=native              : the actual win (llama/common only; ggml already
+#                              has it). 2927/2971 vectorization decisions change
+#                              in llama-context/llama-vocab, sampling.cpp .text -4.8 %.
+# -fno-semantic-interposition: ~0 alone (CI -1.3..+1.1); kept only because the
+#                              measured pair contains it. Safe on gcc/clang.
+# Dead, do not re-add without a benchmark: -fno-plt -fipa-pta -fno-stack-protector
+# -funroll-loops measured 0 % and only bloated the code (ops.cpp .text +57 %,
+# libggml-cpu.so +20 %); -fno-stack-protector also removed the canaries.
+# PGO (-fprofile-generate/-fprofile-use) reached the same ~1 % and needs a
+# two-stage build, so it is deliberately NOT used. LTO (GGML_LTO=ON or global
+# -flto) measured 0 % pp and -0.4..-0.6 % tg, not used either.
+# Host-specific by design: -march=native matches ggml's GGML_NATIVE=ON, i.e. build
+# on the machine that runs it.
+BASE_CFLAGS="-march=native -fno-semantic-interposition"
 LLAMA_CFLAGS=""
 
 # =============================================================================

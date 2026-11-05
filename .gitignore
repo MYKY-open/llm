@@ -1,3 +1,6 @@
 *.cache
 *.tmp
 *~
+# local benchmark scratch, not part of the script
+bench_flags/
+BENCH-cflags.md
