@@ -640,15 +640,48 @@ start_llama_server() {
 # Compiler & Build
 # =============================================================================
 
+# Compiler: clang when it is installed, gcc otherwise. Measured here (gcc 16.2.1 vs
+# clang 23.1.4, same tree, same flags -march=native -fno-semantic-interposition,
+# paired A/B on MiniCPM-35B-A3B and ling-3.0-tiny):
+#   MiniCPM   pp +12.3 % (95 % CI +11.7..+12.9), tg +8.2 % (CI +7.1..+9.3)
+#   ling      pp +29.2 % (CI +25.7..+32.8),       tg +16.3 % (CI +14.6..+18.0)
+#   end-to-end llama-cli with the real sampler:   +10.7 % (CI +7.7..+13.8)
+# Not an ISA difference (-march=native expands to znver3 + AVX2/FMA for both) and
+# output text is identical: clang just emits ~2x the FMA/AVX2 dot-product
+# instructions (4875 vs 2392 in libggml-cpu.so), gcc under-vectorizes ggml's
+# quantized kernels. Override with LLM_CC / LLM_CXX.
+pick_compiler() {
+    if [ -n "${LLM_CC:-}" ] && [ -n "${LLM_CXX:-}" ]; then
+        return 0
+    fi
+    if command -v clang &> /dev/null && command -v clang++ &> /dev/null; then
+        LLM_CC=clang
+        LLM_CXX=clang++
+    else
+        LLM_CC=gcc
+        LLM_CXX=g++
+    fi
+}
+
 setup_compiler() {
-    export CC=gcc
-    export CXX=g++
+    pick_compiler
+    export CC="$LLM_CC"
+    export CXX="$LLM_CXX"
 
     CMAKE_COMPILER_ARGS=(
-        -DCMAKE_C_COMPILER=gcc
-        -DCMAKE_CXX_COMPILER=g++
+        -DCMAKE_C_COMPILER="$LLM_CC"
+        -DCMAKE_CXX_COMPILER="$LLM_CXX"
         -DCMAKE_BUILD_TYPE=Release
     )
+
+    # cmake refuses to change the compiler of an existing cache, and silently
+    # reusing objects from another compiler is worse: wipe build/ on a switch.
+    if [ -f build/.llm_cc ] && [ "$(cat build/.llm_cc)" != "$LLM_CC" ]; then
+        echo "[COMPILER] switching $(cat build/.llm_cc) -> $LLM_CC: wiping build/ (full rebuild)"
+        rm -rf build
+    fi
+    mkdir -p build && echo "$LLM_CC" > build/.llm_cc
+    echo "[COMPILER] using $LLM_CC / $LLM_CXX"
 
     if command -v ccache &> /dev/null; then
         echo "[COMPILER] ccache detected, enabling..."

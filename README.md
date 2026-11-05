@@ -40,6 +40,13 @@ in `llm_models.txt` field 3 (per model), `IK_TUNING`, or on the CLI:
 
 Build options (CUDA/Vulkan/SYCL, static vs shared, etc.) are not hardcoded: `llm -C` opens ccmake on the build dir, then rebuild with `llm -c` (or wipe first with `llm -Re`).
 
+Compiler: **clang when installed**, gcc as fallback (`LLM_CC`/`LLM_CXX` override both).
+Measured on this box (gcc 16 vs clang 23, same tree/flags, paired A/B): MiniCPM-35B-A3B
+pp +12 %, tg +8 %; ling-3.0-tiny pp +29 %, tg +16 %; end-to-end +11 %. Same ISA
+(`-march=native` → znver3 + AVX2/FMA for both) and identical output — clang just emits
+~2× the FMA/AVX2 dot-product instructions in `libggml-cpu.so`. Switching compiler wipes
+`build/` (full rebuild).
+
 ## Usage
 
 Launch the interactive TUI:
