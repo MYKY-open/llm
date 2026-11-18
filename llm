@@ -851,11 +851,48 @@ configure_ram_settings() {
     done
 }
 
+# Sampler presets. Numbers come from a measured RP/emotional-understanding eval
+# (16 probes x 15 models, 2026-11): greedy was the most consistent and never
+# flipped character details; temp 0.4 + XTC scored the only true ambivalence
+# read of any local config. "normal" is the old everyday default.
+# Note: when mirostat != 0 the script forces --temp 1.0 a few lines above.
+apply_sampler_preset() {
+    local p="$1"
+    S_MIROSTAT="0"; S_MIROSTAT_LR="0.1"; S_MIROSTAT_ENT="5.0"
+    S_PRESENCE="0.0"; S_FREQUENCY="0.0"; S_TYPICAL="1.0"
+    S_PENALTY_REPEAT="1.0"; S_PENALTY_LAST_N="64"
+    case "$p" in
+        greedy)
+            S_TEMP="0.0"; S_TOP_P="1.0"; S_TOP_K="0";   S_MIN_P="0.0"
+            S_XTC_PROB="0.0" ;;
+        normal)
+            S_TEMP="1.0"; S_TOP_P="1.0"; S_TOP_K="5";   S_MIN_P="0.05"
+            S_XTC_PROB="0.0" ;;
+        xtc)
+            S_TEMP="0.4"; S_TOP_P="0.95"; S_TOP_K="40"; S_MIN_P="0.02"
+            S_XTC_PROB="0.5"; S_XTC_THRESH="0.1" ;;
+        mirostat)
+            S_TEMP="1.0"; S_TOP_P="0.95"; S_TOP_K="0";  S_MIN_P="0.0"
+            S_XTC_PROB="0.0"; S_MIROSTAT="2" ;;
+    esac
+}
+
+# Which preset do the current values correspond to? "custom" when hand-tuned.
+current_sampler_preset() {
+    if [ "$S_MIROSTAT" != "0" ]; then echo mirostat; return; fi
+    if [ "$S_TEMP" = "0.0" ] || [ "$S_TEMP" = "0" ]; then echo greedy; return; fi
+    if [ "$S_XTC_PROB" != "0.0" ] && [ "$S_XTC_PROB" != "0" ]; then echo xtc; return; fi
+    if [ "$S_TEMP" = "1.0" ] && [ "$S_TOP_K" = "5" ] && [ "$S_MIN_P" = "0.05" ]; then echo normal; return; fi
+    echo custom
+}
+
 configure_settings() {
     while true; do
         local w_desc="\e[97m"
         local w_res="\e[0m"
+        local preset_now=$(current_sampler_preset)
         local options=$(
+            printf "%-3s %-25s %-22s %b%s%b\n" "P)" "Preset" "[$preset_now]" "$w_desc" "- one-shot: greedy / normal / xtc / mirostat" "$w_res"
             if [ "$S_MIROSTAT" == "0" ]; then
             printf "%-3s %-25s %-22s %b%s%b\n" "1)" "Temperature" "[$S_TEMP]" "$w_desc" "- Controls randomness (0 = greedy, higher = creative)" "$w_res"
             fi
@@ -941,6 +978,19 @@ configure_settings() {
                 ;;
             18) read -p "Enter new XTC Probability (current: $S_XTC_PROB): " val; [ -n "$val" ] && S_XTC_PROB="$val" ;;
             19) read -p "Enter new XTC Threshold (current: $S_XTC_THRESH): " val; [ -n "$val" ] && S_XTC_THRESH="$val" ;;
+            P)
+                local pv=$(printf '%s\n' \
+                        "greedy - deterministic, no reroll, never flips details" \
+                        "normal - temp 1.0 / top-k 5, the old default" \
+                        "xtc - temp 0.4 / top-k 40 / XTC 0.5, deepest reads (writes longer)" \
+                        "mirostat - entropy target 2 / 5.0, forces --temp 1.0" \
+                         | fzf --prompt="Sampler preset > " | awk '{print $1}')
+                if [ -n "$pv" ]; then
+                    apply_sampler_preset "$pv"
+                    echo "[LLM] preset: $pv"
+                    sleep 0.4
+                fi
+                ;;
             20) configure_ram_settings ;;
             S) 
                 cat > "$SETTINGS_FILE" <<EOF

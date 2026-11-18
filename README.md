@@ -63,5 +63,6 @@ llm -pi             # Launch Pi coding agent
 llm -he             # Launch Hermes agent
 llm -u              # Upgrade llama.cpp, engines, and installed frontends
 llm -s              # Interactive sampling settings (temp, top-p, min-p, etc.)
+#                      P) applies a sampler preset: greedy | normal | xtc | mirostat
 llm -b              # Switch active llama.cpp backend
 ```
