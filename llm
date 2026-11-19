@@ -865,6 +865,9 @@ apply_sampler_preset() {
         greedy)
             S_TEMP="0.0"; S_TOP_P="1.0"; S_TOP_K="0";   S_MIN_P="0.0"
             S_XTC_PROB="0.0" ;;
+        subtle)
+            S_TEMP="0.3"; S_TOP_P="1.0"; S_TOP_K="2";   S_MIN_P="0.0"
+            S_XTC_PROB="0.0" ;;
         normal)
             S_TEMP="1.0"; S_TOP_P="1.0"; S_TOP_K="5";   S_MIN_P="0.05"
             S_XTC_PROB="0.0" ;;
@@ -881,6 +884,8 @@ apply_sampler_preset() {
 current_sampler_preset() {
     if [ "$S_MIROSTAT" != "0" ]; then echo mirostat; return; fi
     if [ "$S_TEMP" = "0.0" ] || [ "$S_TEMP" = "0" ]; then echo greedy; return; fi
+    if [ "$S_TEMP" = "0.3" ] && [ "$S_TOP_K" = "2" ] \
+       && { [ "$S_XTC_PROB" = "0.0" ] || [ "$S_XTC_PROB" = "0" ]; }; then echo subtle; return; fi
     if [ "$S_XTC_PROB" != "0.0" ] && [ "$S_XTC_PROB" != "0" ]; then echo xtc; return; fi
     if [ "$S_TEMP" = "1.0" ] && [ "$S_TOP_K" = "5" ] && [ "$S_MIN_P" = "0.05" ]; then echo normal; return; fi
     echo custom
@@ -892,7 +897,7 @@ configure_settings() {
         local w_res="\e[0m"
         local preset_now=$(current_sampler_preset)
         local options=$(
-            printf "%-3s %-25s %-22s %b%s%b\n" "P)" "Preset" "[$preset_now]" "$w_desc" "- one-shot: greedy / normal / xtc / mirostat" "$w_res"
+            printf "%-3s %-25s %-22s %b%s%b\n" "P)" "Preset" "[$preset_now]" "$w_desc" "- one-shot: greedy / subtle / normal / xtc / mirostat" "$w_res"
             if [ "$S_MIROSTAT" == "0" ]; then
             printf "%-3s %-25s %-22s %b%s%b\n" "1)" "Temperature" "[$S_TEMP]" "$w_desc" "- Controls randomness (0 = greedy, higher = creative)" "$w_res"
             fi
@@ -981,6 +986,7 @@ configure_settings() {
             P)
                 local pv=$(printf '%s\n' \
                         "greedy - deterministic, no reroll, never flips details" \
+                        "subtle - temp 0.3 / top-k 2, best measured local RP (29.3/32)" \
                         "normal - temp 1.0 / top-k 5, the old default" \
                         "xtc - temp 0.4 / top-k 40 / XTC 0.5, deepest reads (writes longer)" \
                         "mirostat - entropy target 2 / 5.0, forces --temp 1.0" \
